@@ -465,7 +465,9 @@ def train(cfg: TrainConfig) -> None:
                 with torch.no_grad():
                     # Compute W^+ (pseudo‑inverse) once per step (small d_model); cache if needed
                     W = bridge.weight  # [d_model,1024]
-                    W_pinv = torch.linalg.pinv(W, rcond=1e-5)
+                    W_dtype = W.dtype
+                    W_f32 = W.to(torch.float32)
+                    W_pinv = torch.linalg.pinv(W_f32, rcond=1e-5).to(W_dtype)
                 s_1024 = (s @ W_pinv.T).contiguous()  # [B,1024]
 
                 # --- Losses
