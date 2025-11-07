@@ -288,14 +288,21 @@ class SonarDecoder:
         mem = self.bridge(z).unsqueeze(1)  # [B,1,d_model]
         enc_out = BaseModelOutput(last_hidden_state=mem)
 
-        forced_bos = self.tok.convert_tokens_to_ids([tgt_lang])
-        forced_bos_id = forced_bos[0] if forced_bos and forced_bos[0] is not None else None
+        lang_code_map = getattr(self.tok, "lang_code_to_id", None)
+        if not isinstance(lang_code_map, dict):
+            raise ValueError("Tokenizer does not expose a 'lang_code_to_id' mapping")
+        forced_bos_id = lang_code_map.get(tgt_lang)
+        if forced_bos_id is None:
+            raise ValueError(
+                f"Target language '{tgt_lang}' not found in tokenizer lang_code_to_id mapping"
+            )
 
         gen_cfg = GenerationConfig(
             max_new_tokens=max_new_tokens,
             num_beams=num_beams,
             do_sample=False,
             forced_bos_token_id=forced_bos_id,
+            decoder_start_token_id=forced_bos_id,
             use_cache=True,
         )
         outputs = self.model.generate(
