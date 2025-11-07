@@ -36,6 +36,19 @@ Training or running the new visual fusion adapter requires additional packages:
 pip install timm transformers[video] opencv-python
 ```
 
+## Fine-tuning with InfoNCE alignment
+
+The `tools_finetune_sonar_slt.py` helper exposes an optional InfoNCE term that
+encourages better alignment between visual (`z`) and textual (`s`) embeddings:
+
+```
+L_joint = λ_sem L_sem + λ_ce L_ce + λ_ae L_ae + λ_nce L_nce.
+```
+
+Activate it by passing `--lam-nce` and tune the contrastive temperature with
+`--nce-temperature`. The implementation maintains a queue of recent sentence
+embeddings to provide additional negatives during training.
+
 ## Uses
 
 ```Python

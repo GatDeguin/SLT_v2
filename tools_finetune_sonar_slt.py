@@ -33,8 +33,10 @@ Notes
 - We freeze the decoder by default and *only* train the multimodal adapter +
   a small bridge (1024→d_model). This mirrors the paper’s PEFT spirit.
 - Losses follow the paper (equations 5–11):
-    L_joint = λ_sem L_sem  +  λ_ce L_ce  +  λ_ae L_ae (InfoNCE optional)
+    L_joint = λ_sem L_sem  +  λ_ce L_ce  +  λ_ae L_ae  +  λ_nce L_nce
   with strong MSE magnitude regularizer and cosine term.
+- Optional InfoNCE alignment can be enabled with --lam-nce / --nce-temperature,
+  using a queue of recent textual embeddings as extra negatives.
 
 Dependencies
 ------------
@@ -355,6 +357,8 @@ class TrainConfig:
     lam_sem: float = 1.0         # λ_sem
     lam_ce: float = 0.1          # λ_ce
     lam_ae: float = 0.2          # λ_ae
+    lam_nce: float = 0.0         # λ_nce (InfoNCE alignment)
+    nce_temperature: float = 0.07
     text_pool_layers: int = 4
     vit_model: str = "vit_base_patch16_224"
     vit_checkpoint: Optional[Path] = None
@@ -493,6 +497,8 @@ def train(cfg: TrainConfig) -> None:
     step = 0
     log_path = cfg.out_dir / "train_log.jsonl"
     accum_counter = 0
+    nce_queue: Optional[torch.Tensor] = None
+    nce_queue_max = 4096
     for epoch in range(cfg.epochs):
         total_batches = len(dl)
         for batch_idx, (ids, texts, kp, video) in enumerate(dl):
@@ -542,7 +548,25 @@ def train(cfg: TrainConfig) -> None:
                 out_s = decoder(encoder_outputs=enc_out_s, labels=labels)
                 L_ae = out_s.loss
 
-                loss = cfg.lam_sem * L_sem + cfg.lam_ce * L_ce + cfg.lam_ae * L_ae
+                L_nce = torch.zeros((), device=z.device, dtype=z.dtype)
+                s_norm: Optional[torch.Tensor] = None
+                if cfg.lam_nce > 0:
+                    z_norm = F.normalize(z.to(torch.float32), dim=-1)
+                    s_norm = F.normalize(s_1024.to(torch.float32), dim=-1)
+                    negatives = [s_norm]
+                    if nce_queue is not None and nce_queue.numel() > 0:
+                        negatives.append(nce_queue)
+                    all_targets = torch.cat(negatives, dim=0)
+                    logits = torch.matmul(z_norm, all_targets.t()) / max(cfg.nce_temperature, 1e-6)
+                    labels_nce = torch.arange(z_norm.size(0), device=z.device)
+                    L_nce = F.cross_entropy(logits, labels_nce).to(z.dtype)
+
+                loss = (
+                    cfg.lam_sem * L_sem
+                    + cfg.lam_ce * L_ce
+                    + cfg.lam_ae * L_ae
+                    + cfg.lam_nce * L_nce
+                )
 
             batches_remaining_after_current = total_batches - (batch_idx + 1)
             effective_accum = min(cfg.accum, accum_counter + batches_remaining_after_current)
@@ -559,6 +583,16 @@ def train(cfg: TrainConfig) -> None:
                 opt.zero_grad(set_to_none=True)
                 accum_counter = 0
 
+            if cfg.lam_nce > 0 and s_norm is not None:
+                with torch.no_grad():
+                    new_entries = s_norm.detach()
+                    if nce_queue is None:
+                        nce_queue = new_entries
+                    else:
+                        nce_queue = torch.cat([nce_queue, new_entries], dim=0)
+                        if nce_queue.shape[0] > nce_queue_max:
+                            nce_queue = nce_queue[-nce_queue_max :].contiguous()
+
             if step % cfg.log_every == 0:
                 rec = {
                     "step": step,
@@ -569,10 +603,20 @@ def train(cfg: TrainConfig) -> None:
                     "cos": float(cos.detach().cpu()),
                     "L_ce": float(L_ce.detach().cpu()),
                     "L_ae": float(L_ae.detach().cpu()),
+                    "L_nce": float(L_nce.detach().cpu()),
                 }
                 with log_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                print(f"[step {step:6d}] loss={rec['loss']:.4f}  L_sem={rec['L_sem']:.4f}  L_ce={rec['L_ce']:.4f}  L_ae={rec['L_ae']:.4f}")
+                print(
+                    "[step {step:6d}] loss={loss:.4f}  L_sem={L_sem:.4f}  L_ce={L_ce:.4f}  L_ae={L_ae:.4f}  L_nce={L_nce:.4f}".format(
+                        step=step,
+                        loss=rec["loss"],
+                        L_sem=rec["L_sem"],
+                        L_ce=rec["L_ce"],
+                        L_ae=rec["L_ae"],
+                        L_nce=rec["L_nce"],
+                    )
+                )
 
             if step % cfg.save_every == 0:
                 ckpt = {
@@ -642,6 +686,8 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--lam-sem", type=float, default=1.0)
     ap.add_argument("--lam-ce", type=float, default=0.1)
     ap.add_argument("--lam-ae", type=float, default=0.2)
+    ap.add_argument("--lam-nce", type=float, default=0.0)
+    ap.add_argument("--nce-temperature", type=float, default=0.07)
     ap.add_argument("--vit-model", type=str, default="vit_base_patch16_224")
     ap.add_argument("--vit-checkpoint", type=Path, default=None)
     ap.add_argument("--videomae-model", type=str, default="MCG-NJU/videomae-base")
@@ -677,6 +723,8 @@ def parse_args() -> TrainConfig:
         lam_sem=args.lam_sem,
         lam_ce=args.lam_ce,
         lam_ae=args.lam_ae,
+        lam_nce=args.lam_nce,
+        nce_temperature=args.nce_temperature,
         text_pool_layers=args.text_pool_layers,
         vit_model=args.vit_model,
         vit_checkpoint=args.vit_checkpoint,
