@@ -64,7 +64,9 @@ KEYPOINT_CHANNELS = 3  # (x, y, conf)
 
 
 def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
-    """Mirror the training normalisation: center XY and scale to unit radius."""
+    """Center by mean landmark and scale to unit max-radius; keep confidence.
+    Expects (T, N, C≥2). Returns same shape (T, N, 3).
+    """
     coords = arr[..., :2]
     conf = arr[..., 2:3] if arr.shape[-1] >= 3 else np.ones_like(coords[..., :1])
     center = coords.mean(axis=-2, keepdims=True)
