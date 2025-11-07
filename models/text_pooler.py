@@ -88,9 +88,7 @@ class TextPooler:
         self._decoder = self._resolve_decoder(model)
         self._shallow_decoder = _ShallowDecoder(self._decoder, num_layers)
 
-        if not hasattr(tokenizer, "lang_code_to_id") or lang not in tokenizer.lang_code_to_id:
-            raise ValueError(f"Language '{lang}' not available in tokenizer.lang_code_to_id")
-        self._bos_id = tokenizer.lang_code_to_id[lang]
+        self._bos_id = self._resolve_bos_id(tokenizer, lang)
 
     def _resolve_decoder(self, model):
         if hasattr(model, "get_decoder"):
@@ -107,6 +105,30 @@ class TextPooler:
         if base is not None and hasattr(base, "get_encoder"):
             return base.get_encoder()
         raise AttributeError("Provided model does not expose an encoder")
+
+    def _resolve_bos_id(self, tokenizer, lang: str) -> int:
+        bos_id: Optional[int] = None
+
+        if hasattr(tokenizer, "lang_code_to_id"):
+            bos_id = tokenizer.lang_code_to_id.get(lang)
+        if bos_id is None and hasattr(tokenizer, "lang2id"):
+            bos_id = tokenizer.lang2id.get(lang)
+        if bos_id is None and hasattr(tokenizer, "get_lang_id"):
+            try:
+                bos_id = tokenizer.get_lang_id(lang)
+            except (KeyError, ValueError):
+                bos_id = None
+        if bos_id is None:
+            token_id = tokenizer.convert_tokens_to_ids(lang)
+            if token_id != tokenizer.unk_token_id:
+                bos_id = token_id
+
+        if bos_id is None:
+            raise ValueError(
+                "Language '{lang}' not available in tokenizer.".format(lang=lang)
+            )
+
+        return bos_id
 
     def encode(self, texts: Sequence[str]) -> torch.Tensor:
         if not texts:
