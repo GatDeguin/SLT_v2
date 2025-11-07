@@ -298,13 +298,30 @@ class SonarDecoder:
 
     def __init__(self, model_dir: Optional[str], device: torch.device, half: bool = False):
         self.device = device
-        self.model: PreTrainedModel = AutoModelForSeq2SeqLM.from_pretrained(
-            model_dir or "facebook/nllb-200-distilled-600M"
-        ).to(device)
+        default_model = "facebook/nllb-200-distilled-600M"
+
+        def _clean_path(path: Optional[str]) -> Optional[str]:
+            if path is None:
+                return None
+            cleaned = path.strip()
+            if not cleaned or cleaned in {os.sep, "\\"}:
+                return None
+            return os.path.expanduser(cleaned)
+
+        model_id = _clean_path(model_dir) or default_model
+        try:
+            self.model: PreTrainedModel = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
+        except (OSError, ValueError) as exc:
+            if model_id != default_model:
+                print(f"[warn] Failed to load '{model_id}' ({exc}); falling back to {default_model}")
+                model_id = default_model
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
+            else:
+                raise
         if half and device.type == "cuda":
             self.model.half()
         self.model.eval()
-        self.tok = AutoTokenizer.from_pretrained(model_dir or "facebook/nllb-200-distilled-600M")
+        self.tok = AutoTokenizer.from_pretrained(model_id)
         # Determine model d_model
         self.d_model = getattr(self.model.config, "d_model", None) or getattr(self.model.config, "hidden_size", 1024)
         # Map visual z (1024 by default) to model d_model if needed
