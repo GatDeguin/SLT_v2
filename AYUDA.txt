@@ -32,8 +32,10 @@ ENTRENAMIENTO:
 --------------
 
 
+
+
 INFERENCIA:
 ------------
 
-python tools_infer_sonar_slt.py   --videos-dir single_signer\videos   --keypoints-dir single_signer\kp\keypoints   --csv meta_2.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --use-keypoints   --device auto
+python tools_infer_sonar_slt.py   --videos-dir single_signer\videos   --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --use-keypoints   --device auto
 
