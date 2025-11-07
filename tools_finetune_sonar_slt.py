@@ -447,9 +447,12 @@ def train(cfg: TrainConfig) -> None:
 
     step = 0
     log_path = cfg.out_dir / "train_log.jsonl"
+    accum_counter = 0
     for epoch in range(cfg.epochs):
-        for ids, texts, kp in dl:
+        total_batches = len(dl)
+        for batch_idx, (ids, texts, kp) in enumerate(dl):
             step += 1
+            accum_counter += 1
             kp = kp.to(device)
             kp = jitter_keypoints(kp, noise_std=0.04, drop_prob=0.2)
 
@@ -495,10 +498,14 @@ def train(cfg: TrainConfig) -> None:
 
             scaler.scale(loss / cfg.accum).backward()
 
-            if step % cfg.accum == 0:
+            is_accum_boundary = accum_counter >= cfg.accum
+            is_last_batch = (batch_idx + 1) == total_batches
+
+            if is_accum_boundary or is_last_batch:
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
+                accum_counter = 0
 
             if step % cfg.log_every == 0:
                 rec = {
@@ -527,7 +534,19 @@ def train(cfg: TrainConfig) -> None:
                 torch.save(ckpt, path)
                 print(f"[ckpt] Saved {path}")
 
+        if accum_counter != 0:
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+            accum_counter = 0
+
     # Final checkpoint
+    if accum_counter != 0:
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+        accum_counter = 0
+
     path = cfg.out_dir / "checkpoints" / f"adapter_final.pt"
     ckpt = {
         "adapter": adapter.state_dict(),
