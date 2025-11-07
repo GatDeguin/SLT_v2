@@ -147,13 +147,7 @@ class TextPooler:
         encoder_hidden_states = encoder_outputs.last_hidden_state
 
         labels = batch["input_ids"]
-        decoder_input_ids = self._model.prepare_decoder_input_ids_from_labels(labels=labels)
-        if decoder_input_ids is None:
-            decoder_input_ids = torch.full(
-                (labels.size(0), 1), self._bos_id, device=device, dtype=torch.long
-            )
-        else:
-            decoder_input_ids = decoder_input_ids.to(device)
+        decoder_input_ids = self._prepare_decoder_input_ids(labels, device)
 
         decoder_hidden = self._shallow_decoder(
             decoder_input_ids,
@@ -162,6 +156,46 @@ class TextPooler:
         )
         pooled = decoder_hidden[:, 0, :]
         return pooled
+
+    def _prepare_decoder_input_ids(self, labels: torch.Tensor, device: torch.device) -> torch.Tensor:
+        prepare_fn = self._find_prepare_decoder_input_ids_from_labels()
+        if prepare_fn is not None:
+            decoder_input_ids = prepare_fn(labels=labels)
+            if decoder_input_ids is not None:
+                return decoder_input_ids.to(device)
+
+        return self._shift_right(labels.to(device))
+
+    def _find_prepare_decoder_input_ids_from_labels(self):
+        candidates = [self._model]
+
+        base = getattr(self._model, "base_model", None)
+        if base is not None:
+            candidates.append(base)
+            inner = getattr(base, "model", None)
+            if inner is not None:
+                candidates.append(inner)
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            prepare_fn = getattr(candidate, "prepare_decoder_input_ids_from_labels", None)
+            if prepare_fn is not None:
+                return prepare_fn
+        return None
+
+    def _shift_right(self, input_ids: torch.Tensor) -> torch.Tensor:
+        pad_token_id = getattr(self._tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self._tokenizer, "eos_token_id", None)
+        if pad_token_id is None:
+            raise ValueError("Tokenizer must define pad_token_id or eos_token_id for shifting")
+
+        shifted = input_ids.new_full(input_ids.shape, pad_token_id)
+        shifted[:, 1:] = input_ids[:, :-1]
+        shifted[:, 0] = self._bos_id
+        shifted = shifted.masked_fill(shifted == -100, pad_token_id)
+        return shifted
 
     @property
     def bos_id(self) -> int:
