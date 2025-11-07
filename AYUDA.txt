@@ -8,12 +8,12 @@ pip install numpy opencv-python pillow mediapipe tqdm rich
 EXTRACCION:
 -----------
 
-python tools/extract_rois_v2.py `
-   --videos data/single_signer/videos `
-   --out data/single_signer/kp `
+python extract_rois_v2.py `
+   --videos single_signer/videos `
+   --out single_signer/kp `
    --format npz `
    --streams face hands pose `
-   --metadata data/single_signer/metadata.jsonl `
+   --metadata single_signer/metadata.jsonl `
    --delegate cpu `
    --fps-limit 15 `
    --face-model .\models\face_landmarker.task `
@@ -25,9 +25,19 @@ python tools/extract_rois_v2.py `
 VISUALIZACION:
 --------------
 
-python tools/visualize_keypoints_viewer.py    --videos-dir data/single_signer/videos  --keypoints-dir data/single_signer/kp/keypoints --csv meta.csv
+python visualize_keypoints_viewer.py    --videos-dir single_signer/videos  --keypoints-dir single_signer/kp/keypoints --csv meta.csv
 
 
 ENTRENAMIENTO:
 --------------
+
+
+INFERENCIA:
+------------
+
+    python sonar_slt_inference.py `
+        --videos-dir data/single_signer/videos `
+        --keypoints-dir data/single_signer/kp `
+        --adapter-checkpoint checkpoints/sonar_slt_adapter.pt `
+        --output translations.jsonl
 
