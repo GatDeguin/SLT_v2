@@ -34,8 +34,12 @@ def _ensure_torch_stub():
         is_available=lambda: False,
         amp=types.SimpleNamespace(
             GradScaler=lambda *a, **k: object(),
-            autocast=lambda **k: _DummyContext(),
+            autocast=lambda *a, **k: _DummyContext(),
         ),
+    )
+    torch.amp = types.SimpleNamespace(
+        GradScaler=lambda *a, **k: object(),
+        autocast=lambda *a, **k: _DummyContext(),
     )
     torch.optim = types.SimpleNamespace(AdamW=lambda *a, **k: object())
     torch.linalg = types.SimpleNamespace(pinv=lambda *a, **k: None)
