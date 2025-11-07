@@ -39,7 +39,7 @@ import csv
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, WindowsPath
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -431,6 +431,8 @@ def main():
     if not args.adapter_ckpt.is_file():
         raise FileNotFoundError(f"Adapter checkpoint not found: {args.adapter_ckpt}")
     adapter_map_device = _resolve_device(args.adapter_device)
+    if hasattr(torch.serialization, "add_safe_globals"):
+        torch.serialization.add_safe_globals([WindowsPath])
     try:
         ckpt = torch.load(args.adapter_ckpt, map_location=adapter_map_device)
     except (RuntimeError, OSError, ValueError, EOFError) as exc:
