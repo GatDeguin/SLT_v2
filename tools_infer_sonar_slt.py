@@ -93,18 +93,27 @@ def pad_or_sample(array: np.ndarray, target_frames: int, axis: int = 0) -> np.nd
 
 
 def _resolve_device(name: str) -> torch.device:
-    name = name.strip().lower()
-    if name == "auto":
+    cleaned = (name or "").strip()
+    if cleaned.lower() == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
         if torch.backends.mps.is_available():  # mac
             return torch.device("mps")
         return torch.device("cpu")
-    if name in {"cuda", "gpu"} and torch.cuda.is_available():
-        return torch.device("cuda")
-    if name in {"mps"} and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    try:
+        device = torch.device(cleaned)
+    except (TypeError, ValueError):
+        lowered = cleaned.lower()
+        if lowered in {"cuda", "gpu"} and torch.cuda.is_available():
+            return torch.device("cuda")
+        if lowered == "mps" and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        return torch.device("cpu")
+    return device
 
 
 # -----------------------------
@@ -205,7 +214,6 @@ class SonarDecoder:
         device: torch.device,
         half: bool = False,
         *,
-        bridge_state: Optional[Dict[str, torch.Tensor]] = None,
         d_model: Optional[int] = None,
     ):
         self.device = device
@@ -229,7 +237,8 @@ class SonarDecoder:
                 self.model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
             else:
                 raise
-        if half and device.type == "cuda":
+        self._use_half = bool(half and device.type == "cuda")
+        if self._use_half:
             self.model.half()
         self.model.eval()
         self.tok = AutoTokenizer.from_pretrained(model_id)
@@ -239,20 +248,32 @@ class SonarDecoder:
             "hidden_size",
             1024,
         )
-        bridge_out = bridge_state["weight"].shape[0] if bridge_state and "weight" in bridge_state else model_d_model
-        bridge_in = bridge_state["weight"].shape[1] if bridge_state and "weight" in bridge_state else 1024
-        self.d_model = d_model or bridge_out or model_d_model
-        # Align decoder hidden size with bridge output if provided
-        if bridge_out != self.d_model:
-            self.d_model = bridge_out
-        self.bridge = nn.Linear(bridge_in, self.d_model, bias=False).to(device)
-        if bridge_state:
-            self.bridge.load_state_dict(bridge_state)
-        if half and device.type == "cuda":
+        self.d_model = d_model or model_d_model
+        self.bridge: Optional[nn.Linear] = None
+
+    def load_bridge(self, bridge_state: Dict[str, torch.Tensor]) -> None:
+        if not isinstance(bridge_state, dict):
+            raise TypeError("Bridge state must be a state dict mapping strings to tensors")
+        if "weight" not in bridge_state:
+            raise KeyError("Bridge state dict must include a 'weight' tensor")
+        weight = bridge_state["weight"]
+        if not torch.is_tensor(weight):
+            raise TypeError("Bridge 'weight' must be a tensor")
+        out_features, in_features = weight.shape
+        self.d_model = out_features
+        self.bridge = nn.Linear(in_features, out_features, bias=False).to(self.device)
+        missing, unexpected = self.bridge.load_state_dict(bridge_state, strict=False)
+        if missing:
+            raise RuntimeError(f"Bridge checkpoint is missing parameters: {sorted(missing)}")
+        if unexpected:
+            raise RuntimeError(f"Bridge checkpoint has unexpected parameters: {sorted(unexpected)}")
+        if self._use_half:
             self.bridge.half()
 
     @torch.no_grad()
     def generate(self, z_bD: torch.Tensor, tgt_lang: str, max_new_tokens: int = 64, num_beams: int = 4) -> List[str]:
+        if self.bridge is None:
+            raise RuntimeError("Bridge weights have not been loaded. Call load_bridge() before generation")
         # Build pseudo encoder outputs from z as a single‑token memory
         B, D = z_bD.shape
         z = z_bD.to(self.bridge.weight.device)
@@ -282,17 +303,25 @@ class SonarDecoder:
 # End‑to‑end model
 # -----------------------------
 class SonarSLTInference(nn.Module):
-    def __init__(self, num_landmarks: int, adapter_state: Dict[str, torch.Tensor]):
+    def __init__(self, num_landmarks: int):
         super().__init__()
-        self.adapter = FusionAdapter(AdapterConfig(), num_landmarks)
-        self.adapter.load_state_dict(adapter_state)
+        self.fusion_adapter = FusionAdapter(AdapterConfig(), num_landmarks)
+
+    def load_adapter(self, adapter_state: Dict[str, torch.Tensor]) -> None:
+        if not isinstance(adapter_state, dict):
+            raise TypeError("Adapter state must be a state dict mapping strings to tensors")
+        missing, unexpected = self.fusion_adapter.load_state_dict(adapter_state, strict=False)
+        if missing:
+            raise RuntimeError(f"Adapter checkpoint is missing parameters: {sorted(missing)}")
+        if unexpected:
+            raise RuntimeError(f"Adapter checkpoint has unexpected parameters: {sorted(unexpected)}")
 
     @torch.no_grad()
     def forward(self, keypoints_btnc: torch.Tensor) -> torch.Tensor:
         if keypoints_btnc.ndim != 4:
             raise ValueError(f"Expected keypoints (B,T,N,C), got {keypoints_btnc.shape}")
-        kp = keypoints_btnc.to(self.adapter.kp_proj.weight.dtype)
-        return self.adapter(kp)
+        kp = keypoints_btnc.to(self.fusion_adapter.kp_proj.weight.dtype)
+        return self.fusion_adapter(kp)
 
 
 # -----------------------------
@@ -357,7 +386,12 @@ def load_keypoints_array(path: Path) -> np.ndarray:
 def main():
     ap = argparse.ArgumentParser(description="SONAR‑SLT inference: keypoints → semantic decoding")
     ap.add_argument("--keypoints-dir", type=Path, required=True)
-    ap.add_argument("--adapter-ckpt", type=Path, required=True, help="Checkpoint from tools_finetune_sonar_slt.py")
+    ap.add_argument(
+        "--adapter-ckpt",
+        type=Path,
+        required=True,
+        help="Checkpoint from tools_finetune_sonar_slt.py (required when using keypoints)",
+    )
     ap.add_argument("--csv", type=Path, required=True, help="meta.csv with an 'id' or 'video' column")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--tgt-lang", type=str, default="spa_Latn", help="NLLB language token, e.g., 'deu_Latn', 'eng_Latn', 'spa_Latn'")
@@ -367,6 +401,12 @@ def main():
     ap.add_argument("--num-beams", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--sonar-model-dir", type=str, default=None, help="Path to the SONAR HF port (preferred)")
+    ap.add_argument(
+        "--adapter-device",
+        type=str,
+        default="cpu",
+        help="Device for loading the adapter checkpoint (e.g., 'cpu', 'cuda')",
+    )
     args = ap.parse_args()
 
     device = _resolve_device(args.device)
@@ -376,18 +416,33 @@ def main():
     rows = load_meta(args.csv)
     clips = resolve_clips(rows, args.keypoints_dir)
 
-    ckpt = torch.load(args.adapter_ckpt, map_location="cpu")
-    if "adapter" not in ckpt or "bridge" not in ckpt:
-        raise KeyError("Checkpoint must contain 'adapter' and 'bridge' state dicts")
+    if not args.adapter_ckpt.is_file():
+        raise FileNotFoundError(f"Adapter checkpoint not found: {args.adapter_ckpt}")
+    adapter_map_device = _resolve_device(args.adapter_device)
+    try:
+        ckpt = torch.load(args.adapter_ckpt, map_location=adapter_map_device)
+    except (RuntimeError, OSError, ValueError, EOFError) as exc:
+        raise RuntimeError(f"Failed to load adapter checkpoint '{args.adapter_ckpt}': {exc}") from exc
+
+    required_keys = {"adapter", "bridge", "num_landmarks"}
+    missing_keys = [key for key in required_keys if key not in ckpt]
+    if missing_keys:
+        raise KeyError(
+            f"Checkpoint '{args.adapter_ckpt}' is missing required keys: {', '.join(missing_keys)}"
+        )
     adapter_state = ckpt["adapter"]
     bridge_state = ckpt["bridge"]
+    if not isinstance(adapter_state, dict) or not isinstance(bridge_state, dict):
+        raise TypeError("Checkpoint keys 'adapter' and 'bridge' must be state dicts")
+
     num_landmarks = int(ckpt.get("num_landmarks") or 0)
     if num_landmarks <= 0:
         raise ValueError("Checkpoint missing a valid 'num_landmarks'")
     d_model = ckpt.get("d_model")
 
     # Build adapter model
-    model = SonarSLTInference(num_landmarks=num_landmarks, adapter_state=adapter_state).to(device)
+    model = SonarSLTInference(num_landmarks=num_landmarks).to(device)
+    model.load_adapter(adapter_state)
     if args.half and device.type == "cuda":
         model.half()
     model.eval()
@@ -397,9 +452,9 @@ def main():
         args.sonar_model_dir,
         device=device,
         half=args.half,
-        bridge_state=bridge_state,
         d_model=d_model,
     )
+    decoder.load_bridge(bridge_state)
 
     preds_path = args.out / "preds.csv"
     logs_path = args.out / "logs.jsonl"
@@ -413,10 +468,22 @@ def main():
                 raise FileNotFoundError(f"Missing keypoints for {clip.clip_id}: {clip.keypoints_path}")
             kp = load_keypoints_array(clip.keypoints_path)
             if kp.ndim == 2:
-                N = 543 if kp.shape[1] % 543 == 0 else kp.shape[1] // KEYPOINT_CHANNELS
-                kp = kp.reshape(-1, N, KEYPOINT_CHANNELS)
+                feat_dim = kp.shape[1]
+                if feat_dim % KEYPOINT_CHANNELS == 0:
+                    num_points = feat_dim // KEYPOINT_CHANNELS
+                elif feat_dim % 543 == 0:
+                    num_points = 543
+                else:
+                    raise ValueError(
+                        f"Cannot infer landmark count from shape {kp.shape} (expected multiple of {KEYPOINT_CHANNELS})"
+                    )
+                kp = kp.reshape(-1, num_points, KEYPOINT_CHANNELS)
             if kp.ndim != 3:
                 raise ValueError(f"Keypoints must be (T,N,C), got {kp.shape}")
+            if kp.shape[1] != num_landmarks:
+                raise ValueError(
+                    f"Checkpoint expects {num_landmarks} landmarks but found {kp.shape[1]} in {clip.keypoints_path}"
+                )
             kp = kp.astype(np.float32, copy=False)
             kp = normalise_keypoints(kp)
             kp = pad_or_sample(kp, args.T, axis=0)
