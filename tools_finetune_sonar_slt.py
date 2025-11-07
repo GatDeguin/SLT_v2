@@ -583,6 +583,9 @@ def train(cfg: TrainConfig) -> None:
                 tok.src_lang = cfg.tgt_lang
                 batch = tok(texts, return_tensors="pt", padding=True).to(device)
                 labels = batch["input_ids"].clone()
+                pad_token_id = getattr(tok, "pad_token_id", None)
+                if pad_token_id is not None:
+                    labels[labels == pad_token_id] = -100
                 # In seq2seq HF, we pass encoder_outputs + labels
                 enc_out_z = BaseModelOutput(last_hidden_state=mem_z)
                 out_z = decoder(encoder_outputs=enc_out_z, labels=labels)
