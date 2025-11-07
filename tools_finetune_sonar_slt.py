@@ -127,8 +127,20 @@ class CsvRow:
 
 
 def _read_meta_csv(path: Path) -> List[CsvRow]:
-    with path.open("r", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        sample = fh.read(2048)
+        fh.seek(0)
+        delimiter: Optional[str] = None
+        if sample:
+            try:
+                sniffed = csv.Sniffer().sniff(sample, delimiters=",;\t")
+                delimiter = getattr(sniffed, "delimiter", None)
+            except csv.Error:
+                header = sample.splitlines()[0] if sample.splitlines() else ""
+                if ";" in header:
+                    delimiter = ";"
+        reader_kwargs = {"delimiter": delimiter} if delimiter else {}
+        reader = csv.DictReader(fh, **reader_kwargs)
         rows = list(reader)
     out: List[CsvRow] = []
     for row in rows:
