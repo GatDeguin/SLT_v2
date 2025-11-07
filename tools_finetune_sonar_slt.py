@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 SONAR‑SLT — Fine‑tuning ("paper‑perfect") on LSA using keypoints (+ meta_2.csv)
 --------------------------------------------------------------------------------
 
