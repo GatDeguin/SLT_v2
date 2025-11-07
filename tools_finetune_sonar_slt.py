@@ -434,7 +434,7 @@ def train(cfg: TrainConfig) -> None:
 
     # Optimiser
     opt = torch.optim.AdamW(list(adapter.parameters()) + list(bridge.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.half and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.half and device.type == "cuda")
 
     # Loader
     def collate(batch):
@@ -453,7 +453,7 @@ def train(cfg: TrainConfig) -> None:
             kp = kp.to(device)
             kp = jitter_keypoints(kp, noise_std=0.04, drop_prob=0.2)
 
-            with torch.cuda.amp.autocast(enabled=cfg.half and device.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=cfg.half and device.type == "cuda"):
                 # --- Visual → semantic vector z (Eq. 1–3)
                 z = adapter(kp)                # [B,1024]
                 mem_z = bridge(z).unsqueeze(1) # [B,1,d_model]
