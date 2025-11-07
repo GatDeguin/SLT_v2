@@ -496,7 +496,11 @@ def train(cfg: TrainConfig) -> None:
 
                 loss = cfg.lam_sem * L_sem + cfg.lam_ce * L_ce + cfg.lam_ae * L_ae
 
-            scaler.scale(loss / cfg.accum).backward()
+            batches_remaining_after_current = total_batches - (batch_idx + 1)
+            effective_accum = min(cfg.accum, accum_counter + batches_remaining_after_current)
+            effective_accum = max(effective_accum, 1)
+
+            scaler.scale(loss / effective_accum).backward()
 
             is_accum_boundary = accum_counter >= cfg.accum
             is_last_batch = (batch_idx + 1) == total_batches
