@@ -35,9 +35,5 @@ ENTRENAMIENTO:
 INFERENCIA:
 ------------
 
-    python sonar_slt_inference.py `
-        --videos-dir data/single_signer/videos `
-        --keypoints-dir data/single_signer/kp `
-        --adapter-checkpoint checkpoints/sonar_slt_adapter.pt `
-        --output translations.jsonl
+python tools_infer_sonar_slt.py   --videos-dir single_signer\videos   --keypoints-dir single_signer\kp\keypoints   --csv meta_2.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --use-keypoints   --device auto
 
