@@ -131,14 +131,29 @@ def _read_meta_csv(path: Path) -> List[CsvRow]:
         sample = fh.read(2048)
         fh.seek(0)
         delimiter: Optional[str] = None
+        header_line = ""
         if sample:
+            lines = sample.splitlines()
+            if lines:
+                header_line = lines[0]
+            preferred_delimiter: Optional[str] = None
+            if header_line:
+                counts = {ch: header_line.count(ch) for ch in (",", ";", "\t")}
+                semicolons = counts[";"]
+                commas = counts[","]
+                if semicolons > 0 and commas == 0:
+                    preferred_delimiter = ";"
+                elif semicolons > 0 and semicolons >= max(counts.values()):
+                    preferred_delimiter = ";"
             try:
                 sniffed = csv.Sniffer().sniff(sample, delimiters=",;\t")
                 delimiter = getattr(sniffed, "delimiter", None)
             except csv.Error:
-                header = sample.splitlines()[0] if sample.splitlines() else ""
-                if ";" in header:
-                    delimiter = ";"
+                delimiter = None
+            if preferred_delimiter:
+                delimiter = preferred_delimiter
+        if not delimiter and header_line and ";" in header_line:
+            delimiter = ";"
         reader_kwargs = {"delimiter": delimiter} if delimiter else {}
         reader = csv.DictReader(fh, **reader_kwargs)
         rows = list(reader)

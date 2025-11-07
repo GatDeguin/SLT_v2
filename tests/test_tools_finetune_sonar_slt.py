@@ -145,3 +145,29 @@ def test_read_meta_csv_accepts_semicolon(tmp_path):
     assert len(rows) == 1
     assert rows[0].vid == "example_01"
     assert rows[0].text == "hola mundo"
+
+
+def test_read_meta_csv_prefers_semicolon_header(tmp_path):
+    _ensure_torch_stub()
+    _ensure_numpy_stub()
+    _ensure_transformers_stub()
+
+    module_path = Path(__file__).resolve().parent.parent / "tools_finetune_sonar_slt.py"
+    spec = importlib.util.spec_from_file_location("tools_finetune_sonar_slt", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["tools_finetune_sonar_slt"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    csv_path = tmp_path / "meta.csv"
+    csv_path.write_text(
+        "id;text;video\n"
+        "clip_001;estamos en noviembre, y reflexionaba.;noticias-en-lengua-de-senas-argentina-resumen-semanal-29112020\n",
+        encoding="utf-8",
+    )
+
+    rows = module._read_meta_csv(csv_path)
+
+    assert len(rows) == 1
+    assert rows[0].vid == "clip_001"
+    assert rows[0].text == "estamos en noviembre, y reflexionaba."
