@@ -567,10 +567,11 @@ def train(cfg: TrainConfig) -> None:
                 with torch.no_grad():
                     # Compute W^+ (pseudo‑inverse) once per step (small d_model); cache if needed
                     W = bridge.weight  # [d_model,1024]
-                    W_dtype = W.dtype
                     W_f32 = W.to(torch.float32)
-                    W_pinv = torch.linalg.pinv(W_f32, rcond=1e-5).to(W_dtype)
-                s_1024 = (s @ W_pinv.T).contiguous()  # [B,1024]
+                    W_pinv_fp32 = torch.linalg.pinv(W_f32, rcond=1e-5)
+                s_fp32 = s.to(torch.float32)
+                s_1024_fp32 = torch.matmul(s_fp32, W_pinv_fp32.T).contiguous()
+                s_1024 = s_1024_fp32.to(z.dtype)  # [B,1024]
 
                 # --- Losses
                 # L_sem = α * MSE(z, s_1024) + β * (1 - cos(z, s_1024))
@@ -597,7 +598,7 @@ def train(cfg: TrainConfig) -> None:
                 s_norm: Optional[torch.Tensor] = None
                 if cfg.lam_nce > 0:
                     z_norm = F.normalize(z.to(torch.float32), dim=-1)
-                    s_norm = F.normalize(s_1024.to(torch.float32), dim=-1)
+                    s_norm = F.normalize(s_1024_fp32, dim=-1)
                     negatives = [s_norm]
                     if nce_queue is not None and nce_queue.numel() > 0:
                         negatives.append(nce_queue)
