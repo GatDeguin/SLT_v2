@@ -28,6 +28,14 @@ Thanks to @cointegrated for providing the weights for the SONAR encoder part.
 }
 ```
 
+## Multimodal adapter dependencies
+
+Training or running the new visual fusion adapter requires additional packages:
+
+```bash
+pip install timm transformers[video] opencv-python
+```
+
 ## Uses
 
 ```Python
