@@ -17,7 +17,9 @@ Notes
 -----
 - Expects (T, N, C) keypoints (MediaPipe Holistic by default) normalised as in training.
 - Provide the checkpoint containing `adapter` and `bridge` weights from the fine‑tuning script.
-- If the SONAR HF port is installed locally, pass `--sonar-model-dir` to point at it.
+- Uses the SONAR HF port `mtmlt/sonar-nllb-200-1.3B` by default (matching training).
+- Bridge checkpoints remain compatible; `load_bridge` infers the correct shape from saved weights.
+- Override the decoder with `--sonar-model-dir /path/or/repo` if you have a local copy.
 - Designed to run on CPU or CUDA; use --half on capable GPUs.
 
 Dependencies
@@ -219,7 +221,8 @@ class SonarDecoder:
         d_model: Optional[int] = None,
     ):
         self.device = device
-        default_model = "facebook/nllb-200-distilled-600M"
+        # Matches TrainConfig.model_name to ensure existing bridge checkpoints load without changes.
+        default_model = "mtmlt/sonar-nllb-200-1.3B"
 
         def _clean_path(path: Optional[str]) -> Optional[str]:
             if path is None:
@@ -234,7 +237,9 @@ class SonarDecoder:
             self.model: PreTrainedModel = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
         except (OSError, ValueError) as exc:
             if model_id != default_model:
-                print(f"[warn] Failed to load '{model_id}' ({exc}); falling back to {default_model}")
+                print(
+                    f"[warn] Failed to load '{model_id}' ({exc}); falling back to '{default_model}'"
+                )
                 model_id = default_model
                 self.model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
             else:
@@ -402,7 +407,12 @@ def main():
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--num-beams", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=64)
-    ap.add_argument("--sonar-model-dir", type=str, default=None, help="Path to the SONAR HF port (preferred)")
+    ap.add_argument(
+        "--sonar-model-dir",
+        type=str,
+        default=None,
+        help="Path or HF repo for SONAR decoder override (default: 'mtmlt/sonar-nllb-200-1.3B')",
+    )
     ap.add_argument(
         "--adapter-device",
         type=str,
