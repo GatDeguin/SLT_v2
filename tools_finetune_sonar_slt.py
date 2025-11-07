@@ -57,6 +57,7 @@ import json
 import math
 import os
 import random
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -72,20 +73,64 @@ from transformers import (
 )
 from transformers.modeling_outputs import BaseModelOutput
 
-from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
+try:  # pragma: no cover - optional dependency
+    from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
+except Exception:  # pragma: no cover - gracefully handle absence during tests
+    def _missing_peft(*_: object, **__: object) -> None:
+        raise ModuleNotFoundError(
+            "Optional dependency 'peft' is required for LoRA fine-tuning."
+            " Install it with `pip install peft`."
+        )
 
-from models.text_pooler import TextPooler
+    # Provide lightweight shims so module import succeeds without peft.
+    def LoraConfig(*args: object, **kwargs: object) -> None:  # type: ignore[misc]
+        _missing_peft()
+
+    TaskType = types.SimpleNamespace(SEQ_2_SEQ_LM="seq2seq_lm")  # type: ignore[assignment]
+
+    def get_peft_model(*args: object, **kwargs: object) -> None:  # type: ignore[misc]
+        _missing_peft()
+
+    def get_peft_model_state_dict(*args: object, **kwargs: object) -> None:  # type: ignore[misc]
+        _missing_peft()
+
+try:  # pragma: no cover - optional dependency
+    from models.text_pooler import TextPooler
+except Exception:  # pragma: no cover - keep import-time optionality for tests
+    class TextPooler:  # type: ignore[dead-code]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ModuleNotFoundError(
+                "Local import 'models.text_pooler.TextPooler' not available."
+                " Ensure project modules are on PYTHONPATH when running training."
+            )
 
 try:  # pragma: no cover - optional dependency
     import cv2
 except Exception:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore[assignment]
 
-from slt.utils.visual_adapter import (
-    AdapterConfig,
-    KEYPOINT_CHANNELS as ADAPTER_KEYPOINT_CHANNELS,
-    VisualFusionAdapter,
-)
+try:  # pragma: no cover - optional dependency
+    from slt.utils.visual_adapter import (
+        AdapterConfig,
+        KEYPOINT_CHANNELS as ADAPTER_KEYPOINT_CHANNELS,
+        VisualFusionAdapter,
+    )
+except Exception:  # pragma: no cover - ensure module import during tests
+    ADAPTER_KEYPOINT_CHANNELS = 3
+
+    class AdapterConfig:  # type: ignore[dead-code]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ModuleNotFoundError(
+                "Optional visual adapter dependencies are missing."
+                " Install project in editable mode to train the adapter."
+            )
+
+    class VisualFusionAdapter:  # type: ignore[dead-code]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ModuleNotFoundError(
+                "Optional visual adapter dependencies are missing."
+                " Install project in editable mode to train the adapter."
+            )
 
 # -----------------------------
 # Constants / Layout helpers
