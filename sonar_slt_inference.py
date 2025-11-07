@@ -12,11 +12,13 @@ The implementation focuses on reproducibility and clarity:
 * Keypoints are normalised frame-wise to remove translation and scale
   variations, retaining visibility/confidence channels.
 * Video frames are sampled uniformly, resized to 224x224 and embedded with a
-  lightweight ResNet18 backbone. The weights default to the ImageNet initialisa-
-  tion and can be overridden through a checkpoint.
-* Both streams go through temporal Transformer encoders followed by a fusion
-  Transformer. The fused representation is projected onto the 1024-dim SONAR
-  space and fed directly into the decoder as a single "pseudo token" sequence.
+  ViT image encoder together with a VideoMAE spatio-temporal backbone. Both
+  modules default to publicly available pre-trained weights and can be
+  overridden through checkpoints.
+* Keypoints and dual visual features are processed through temporal
+  Transformers and a SpaMo fusion block. The fused representation is projected
+  onto the 1024-dim SONAR space and fed directly into the decoder as a single
+  "pseudo token" sequence.
 
 The adapter weights that map sign representations to SONAR space are expected
 in PyTorch ``state_dict`` format. They can be trained following the training
@@ -45,7 +47,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch import nn
 from transformers import (
     AutoTokenizer,
     BaseModelOutput,
@@ -57,12 +58,11 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore[assignment]
 
-try:  # pragma: no cover - optional dependency
-    from torchvision import models
-    from torchvision.models import ResNet18_Weights
-except Exception:  # pragma: no cover - optional dependency
-    models = None  # type: ignore[assignment]
-    ResNet18_Weights = None  # type: ignore[assignment]
+from slt.utils.visual_adapter import (
+    AdapterConfig,
+    KEYPOINT_CHANNELS,
+    VisualFusionAdapter,
+)
 
 LOGGER = logging.getLogger("sonar_slt_inference")
 
@@ -70,7 +70,7 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 KEYPOINT_TOTAL_LANDMARKS = 33 + 468 + 2 * 21  # pose + face + 2 hands
 KEYPOINT_CHANNELS = 3  # (x, y, confidence)
 DEFAULT_FRAME_SIZE = 224
-DEFAULT_NUM_FRAMES = 96
+DEFAULT_NUM_FRAMES = 16
 DEFAULT_KEYPOINT_FRAMES = 192
 DEFAULT_TRANSFORMER_HEADS = 8
 DEFAULT_TRANSFORMER_LAYERS = 4
@@ -88,229 +88,7 @@ class GenerationConfig:
     repetition_penalty: float = 1.1
 
 
-@dataclass
-class AdapterConfig:
-    """Hyper-parameters for the multimodal adapter."""
-
-    hidden_size: int = 1024
-    video_hidden: int = 512
-    keypoint_hidden: int = 512
-    fusion_layers: int = DEFAULT_TRANSFORMER_LAYERS
-    fusion_heads: int = DEFAULT_TRANSFORMER_HEADS
-    dropout: float = DEFAULT_TRANSFORMER_DROPOUT
-    keypoint_layers: int = DEFAULT_TRANSFORMER_LAYERS
-    keypoint_heads: int = DEFAULT_TRANSFORMER_HEADS
-    video_layers: int = DEFAULT_TRANSFORMER_LAYERS
-    video_heads: int = DEFAULT_TRANSFORMER_HEADS
-
-
-def _sinusoidal_positional_encoding(length: int, dim: int, device: torch.device) -> torch.Tensor:
-    """Generate sinusoidal positional encodings."""
-
-    position = torch.arange(length, dtype=torch.float32, device=device).unsqueeze(1)
-    div_term = torch.exp(
-        torch.arange(0, dim, 2, dtype=torch.float32, device=device)
-        * (-math.log(10000.0) / dim)
-    )
-    pe = torch.zeros(length, dim, device=device, dtype=torch.float32)
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
-
-
-class _TransformerEncoder(nn.Module):
-    """Wrapper around ``nn.TransformerEncoder`` with sinusoidal embeddings."""
-
-    def __init__(
-        self,
-        d_model: int,
-        *,
-        num_layers: int,
-        nhead: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if inputs.ndim != 3:
-            raise ValueError("Transformer inputs must have shape (batch, time, dim)")
-        positions = _sinusoidal_positional_encoding(
-            inputs.size(1), inputs.size(2), inputs.device
-        )
-        hidden = inputs + positions.unsqueeze(0)
-        hidden = self.dropout(hidden)
-        hidden = self.encoder(hidden)
-        return self.layer_norm(hidden)
-
-
-class KeypointEncoder(nn.Module):
-    """Temporal encoder for MediaPipe holistic keypoints."""
-
-    def __init__(self, config: AdapterConfig) -> None:
-        super().__init__()
-        input_dim = KEYPOINT_TOTAL_LANDMARKS * KEYPOINT_CHANNELS
-        self.proj = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, config.keypoint_hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.keypoint_hidden, config.keypoint_hidden),
-        )
-        self.temporal = _TransformerEncoder(
-            config.keypoint_hidden,
-            num_layers=config.keypoint_layers,
-            nhead=config.keypoint_heads,
-            dropout=config.dropout,
-        )
-
-    def forward(self, keypoints: torch.Tensor) -> torch.Tensor:
-        """Encode keypoints into temporal embeddings.
-
-        Args:
-            keypoints: Tensor shaped ``(batch, frames, landmarks, channels)``.
-        """
-
-        if keypoints.ndim != 4:
-            raise ValueError(
-                "Keypoints tensor must be 4-D (batch, time, landmarks, channels)."
-            )
-        batch, frames, landmarks, channels = keypoints.shape
-        if landmarks != KEYPOINT_TOTAL_LANDMARKS or channels != KEYPOINT_CHANNELS:
-            raise ValueError(
-                "Unexpected keypoint shape: expected (%d, %d) landmarks/channels, got %s"
-                % (KEYPOINT_TOTAL_LANDMARKS, KEYPOINT_CHANNELS, keypoints.shape)
-            )
-        flattened = keypoints.view(batch, frames, -1)
-        embedded = self.proj(flattened)
-        return self.temporal(embedded)
-
-
-class _IdentityBackbone(nn.Module):
-    """Fallback backbone when torchvision is not available."""
-
-    def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.GELU(),
-            nn.Linear(output_dim, output_dim),
-        )
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.head(inputs)
-
-
-class VideoEncoder(nn.Module):
-    """ResNet-based temporal encoder for RGB frames."""
-
-    def __init__(self, config: AdapterConfig) -> None:
-        super().__init__()
-        hidden = config.video_hidden
-        if models is None or ResNet18_Weights is None:
-            LOGGER.warning(
-                "torchvision is not available; falling back to a linear frame encoder"
-            )
-            self._use_torchvision = False
-            self.backbone = _IdentityBackbone(DEFAULT_FRAME_SIZE * DEFAULT_FRAME_SIZE * 3, hidden)
-        else:  # pragma: no cover - requires torchvision
-            weights = ResNet18_Weights.IMAGENET1K_V1
-            backbone = models.resnet18(weights=weights)
-            modules = list(backbone.children())[:-1]
-            self.backbone = nn.Sequential(*modules)
-            self.frame_pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.frame_norm = nn.LayerNorm(512)
-            self.frame_proj = nn.Linear(512, hidden)
-            self._use_torchvision = True
-            mean = torch.tensor(weights.meta["mean"], dtype=torch.float32)
-            std = torch.tensor(weights.meta["std"], dtype=torch.float32)
-            self.register_buffer("norm_mean", mean.view(1, 3, 1, 1), persistent=False)
-            self.register_buffer("norm_std", std.view(1, 3, 1, 1), persistent=False)
-        self.temporal = _TransformerEncoder(
-            hidden,
-            num_layers=config.video_layers,
-            nhead=config.video_heads,
-            dropout=config.dropout,
-        )
-
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        """Encode a batch of frames.
-
-        Args:
-            frames: Tensor shaped ``(batch, time, 3, H, W)`` in RGB and [0, 1] range.
-        """
-
-        if frames.ndim != 5:
-            raise ValueError("Frames tensor must be 5-D (batch, time, channels, H, W)")
-        batch, time, channels, height, width = frames.shape
-        if channels != 3:
-            raise ValueError("Expected 3-channel RGB frames, got %d" % channels)
-
-        if not getattr(self, "_use_torchvision", False):
-            flat = frames.view(batch, time, -1)
-            embedded = self.backbone(flat)
-            return self.temporal(embedded)
-
-        frames = frames.view(batch * time, channels, height, width)
-        frames = (frames - self.norm_mean) / self.norm_std
-        features = self.backbone(frames)
-        features = self.frame_pool(features).view(batch, time, -1)
-        features = self.frame_norm(features)
-        features = self.frame_proj(features)
-        return self.temporal(features)
-
-
-class FusionAdapter(nn.Module):
-    """Fuse keypoint and video embeddings and project to SONAR space."""
-
-    def __init__(self, config: AdapterConfig) -> None:
-        super().__init__()
-        self.keypoint_encoder = KeypointEncoder(config)
-        self.video_encoder = VideoEncoder(config)
-        self.fusion = _TransformerEncoder(
-            config.hidden_size,
-            num_layers=config.fusion_layers,
-            nhead=config.fusion_heads,
-            dropout=config.dropout,
-        )
-        self.key_proj = nn.Linear(config.keypoint_hidden, config.hidden_size)
-        self.video_proj = nn.Linear(config.video_hidden, config.hidden_size)
-        self.output_norm = nn.LayerNorm(config.hidden_size)
-        self.output_proj = nn.Linear(config.hidden_size, config.hidden_size)
-
-    def forward(
-        self,
-        keypoints: Optional[torch.Tensor],
-        frames: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if keypoints is None and frames is None:
-            raise ValueError("At least one modality (keypoints or frames) must be provided")
-
-        streams: List[torch.Tensor] = []
-        if keypoints is not None:
-            key_emb = self.keypoint_encoder(keypoints)
-            streams.append(self.key_proj(key_emb))
-        if frames is not None:
-            vid_emb = self.video_encoder(frames)
-            streams.append(self.video_proj(vid_emb))
-
-        fused = torch.cat(streams, dim=1)
-        fused = self.fusion(fused)
-        pooled = fused.mean(dim=1)
-        pooled = self.output_norm(pooled)
-        return self.output_proj(pooled)
-
+# Adapter configuration is imported from ``slt.utils.visual_adapter``
 
 def _load_keypoints(path: Path) -> np.ndarray:
     if path.suffix == ".npz":
@@ -367,6 +145,16 @@ def _pad_or_sample(
     return np.concatenate([array, pad_values], axis=axis)
 
 
+def _crop_with_offset(array: np.ndarray, target_frames: int, offset: float) -> np.ndarray:
+    if array.shape[0] <= target_frames:
+        return array
+    offset = float(np.clip(offset, 0.0, 1.0))
+    max_start = max(array.shape[0] - target_frames, 0)
+    start = int(round(max_start * offset))
+    end = start + target_frames
+    return array[start:end]
+
+
 def _read_video_frames(path: Path) -> Tuple[np.ndarray, float]:
     if cv2 is None:
         raise RuntimeError("OpenCV is required to read videos")
@@ -395,12 +183,16 @@ def _align_modalities(
     frames: Optional[np.ndarray],
     *,
     num_kp_frames: int,
-    num_video_frames: int,
+    clip_frames: int,
+    clip_offset: Optional[float],
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     kp = _pad_or_sample(keypoints, num_kp_frames, axis=0)
     video = None
     if frames is not None:
-        video = _pad_or_sample(frames, num_video_frames, axis=0)
+        clipped = frames
+        if clip_offset is not None:
+            clipped = _crop_with_offset(clipped, clip_frames, clip_offset)
+        video = _pad_or_sample(clipped, clip_frames, axis=0)
     return kp, video
 
 
@@ -439,13 +231,14 @@ class SampleResult:
 def run_inference(
     model: M2M100ForConditionalGeneration,
     tokenizer: AutoTokenizer,
-    adapter: FusionAdapter,
+    adapter: VisualFusionAdapter,
     samples: Sequence[Tuple[str, Optional[Path], Path]],
     generation_config: GenerationConfig,
     *,
     device: torch.device,
     num_kp_frames: int,
-    num_video_frames: int,
+    clip_frames: int,
+    clip_offset: Optional[float],
 ) -> List[SampleResult]:
     adapter.eval()
     model.eval()
@@ -464,7 +257,11 @@ def run_inference(
                 frames_array = None
 
         keypoints, frames_array = _align_modalities(
-            keypoints, frames_array, num_kp_frames=num_kp_frames, num_video_frames=num_video_frames
+            keypoints,
+            frames_array,
+            num_kp_frames=num_kp_frames,
+            clip_frames=clip_frames,
+            clip_offset=clip_offset,
         )
 
         kp_tensor = (
@@ -474,8 +271,12 @@ def run_inference(
         )
         frames_tensor: Optional[torch.Tensor] = None
         if frames_array is not None:
-            frames_tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2).unsqueeze(0)
-            frames_tensor = frames_tensor.to(device=device, dtype=torch.float32)
+            frames_tensor = (
+                torch.from_numpy(frames_array)
+                .permute(0, 3, 1, 2)
+                .unsqueeze(0)
+                .to(device=device, dtype=torch.float32)
+            )
 
         with torch.inference_mode():
             embedding = adapter(kp_tensor, frames_tensor)
@@ -502,14 +303,16 @@ def run_inference(
     return results
 
 
-def _load_adapter_checkpoint(adapter: FusionAdapter, checkpoint: Optional[Path]) -> None:
+def _load_adapter_checkpoint(adapter: VisualFusionAdapter, checkpoint: Optional[Path]) -> None:
     if checkpoint is None:
         LOGGER.warning("No adapter checkpoint provided; using random initialisation")
         return
     state_dict = torch.load(checkpoint, map_location="cpu")
     if isinstance(state_dict, dict) and "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
-    adapter.load_state_dict(state_dict)
+    if isinstance(state_dict, dict) and "adapter" in state_dict:
+        state_dict = state_dict["adapter"]
+    adapter.load_state_dict(state_dict, strict=False)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -586,16 +389,46 @@ def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Optional JSONL file to store translations.",
     )
     parser.add_argument(
-        "--num-video-frames",
+        "--clip-frames",
         type=int,
         default=DEFAULT_NUM_FRAMES,
-        help="Number of frames per video clip after sampling/padding.",
+        help="Number of RGB frames per clip passed to the visual backbones.",
     )
     parser.add_argument(
         "--num-keypoint-frames",
         type=int,
         default=DEFAULT_KEYPOINT_FRAMES,
         help="Number of keypoint frames after sampling/padding.",
+    )
+    parser.add_argument(
+        "--clip-offset",
+        type=float,
+        default=None,
+        help="Optional relative offset [0-1] for temporal cropping before sampling.",
+    )
+    parser.add_argument(
+        "--vit-model",
+        type=str,
+        default="vit_base_patch16_224",
+        help="timm ViT backbone identifier.",
+    )
+    parser.add_argument(
+        "--vit-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional checkpoint with fine-tuned ViT weights.",
+    )
+    parser.add_argument(
+        "--videomae-model",
+        type=str,
+        default="MCG-NJU/videomae-base",
+        help="Hugging Face identifier for the VideoMAE backbone.",
+    )
+    parser.add_argument(
+        "--videomae-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional checkpoint with fine-tuned VideoMAE weights.",
     )
     parser.add_argument(
         "--verbose",
@@ -615,8 +448,24 @@ def main(cli_args: Optional[Sequence[str]] = None) -> None:
         LOGGER.warning("Videos directory %s does not exist", args.videos_dir)
 
     device = torch.device(args.device)
+
+    samples = _discover_samples(args.videos_dir, args.keypoints_dir)
+    if not samples:
+        raise RuntimeError(
+            "No samples found. Ensure keypoints are stored as .npz/.npy files in the directory."
+        )
+
+    first_keypoints = _load_keypoints(samples[0][2])
+    num_landmarks = first_keypoints.shape[1]
     adapter_config = AdapterConfig()
-    adapter = FusionAdapter(adapter_config).to(device)
+    adapter = VisualFusionAdapter(
+        adapter_config,
+        num_points=num_landmarks,
+        vit_name=args.vit_model,
+        vit_checkpoint=args.vit_checkpoint,
+        videomae_name=args.videomae_model,
+        videomae_checkpoint=args.videomae_checkpoint,
+    ).to(device)
     _load_adapter_checkpoint(adapter, args.adapter_checkpoint)
 
     LOGGER.info("Loading SONAR decoder model: %s", args.model_name)
@@ -634,12 +483,6 @@ def main(cli_args: Optional[Sequence[str]] = None) -> None:
         repetition_penalty=args.repetition_penalty,
     )
 
-    samples = _discover_samples(args.videos_dir, args.keypoints_dir)
-    if not samples:
-        raise RuntimeError(
-            "No samples found. Ensure keypoints are stored as .npz/.npy files in the directory."
-        )
-
     results = run_inference(
         model,
         tokenizer,
@@ -648,7 +491,8 @@ def main(cli_args: Optional[Sequence[str]] = None) -> None:
         generation_config,
         device=device,
         num_kp_frames=args.num_keypoint_frames,
-        num_video_frames=args.num_video_frames,
+        clip_frames=args.clip_frames,
+        clip_offset=args.clip_offset,
     )
 
     if args.output is not None:

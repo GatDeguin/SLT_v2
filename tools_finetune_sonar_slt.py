@@ -38,7 +38,7 @@ Notes
 
 Dependencies
 ------------
-  pip install torch torchvision timm transformers peft numpy pandas opencv-python rich
+  pip install torch timm "transformers[video]" peft numpy pandas opencv-python rich
 
 Outputs
 -------
@@ -70,12 +70,25 @@ from transformers import (
 )
 from transformers.modeling_outputs import BaseModelOutput
 
+try:  # pragma: no cover - optional dependency
+    import cv2
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None  # type: ignore[assignment]
+
+from slt.utils.visual_adapter import (
+    AdapterConfig,
+    KEYPOINT_CHANNELS as ADAPTER_KEYPOINT_CHANNELS,
+    VisualFusionAdapter,
+)
+
 # -----------------------------
 # Constants / Layout helpers
 # -----------------------------
-KEYPOINT_CHANNELS = 3  # (x, y, conf)
+KEYPOINT_CHANNELS = ADAPTER_KEYPOINT_CHANNELS  # (x, y, conf)
 DEFAULT_T = 128
 DEFAULT_IMG_SIZE = 224
+DEFAULT_CLIP_FRAMES = 16
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 DEFAULT_D_MODEL = 1024
 RNG = random.Random(123)
 
@@ -181,12 +194,27 @@ def _read_meta_csv(path: Path) -> List[CsvRow]:
 # Dataset
 # -----------------------------
 class KPTextDataset(Dataset):
-    def __init__(self, keypoints_dir: Path, csv_path: Path, T: int = DEFAULT_T, shuffle: bool = True):
+    def __init__(
+        self,
+        keypoints_dir: Path,
+        csv_path: Path,
+        T: int = DEFAULT_T,
+        *,
+        shuffle: bool = True,
+        video_dir: Optional[Path] = None,
+        clip_frames: int = DEFAULT_CLIP_FRAMES,
+        frame_size: int = DEFAULT_IMG_SIZE,
+    ) -> None:
         self.keypoints_dir = keypoints_dir
+        self.video_dir = video_dir
+        if self.video_dir is not None and cv2 is None:
+            raise RuntimeError("OpenCV (cv2) is required to load paired videos")
         self.items = _read_meta_csv(csv_path)
         if shuffle:
             RNG.shuffle(self.items)
         self.T = int(T)
+        self.clip_frames = int(clip_frames)
+        self.frame_size = int(frame_size)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -221,96 +249,57 @@ class KPTextDataset(Dataset):
             keypoints = keypoints.reshape(-1, N, KEYPOINT_CHANNELS)
         keypoints = normalise_keypoints(keypoints)
         keypoints = pad_or_sample(keypoints, self.T, axis=0)
+        video_tensor: Optional[torch.Tensor] = None
+        if self.video_dir is not None:
+            video_path = self._resolve_video_path(row.vid)
+            if video_path is None:
+                raise FileNotFoundError(
+                    f"Video not found for id={row.vid} in {self.video_dir}"
+                )
+            video_np = self._load_video(video_path)
+            video_np = pad_or_sample(video_np, self.clip_frames, axis=0)
+            video_tensor = torch.from_numpy(video_np).to(torch.float32)
         return {
             "id": row.vid,
             "keypoints": torch.from_numpy(keypoints).to(torch.float32),  # (T, N, C)
+            "video": video_tensor,
             "text": row.text,
         }
 
+    def _resolve_video_path(self, stem: str) -> Optional[Path]:
+        if self.video_dir is None:
+            return None
+        for ext in VIDEO_EXTENSIONS:
+            candidate = self.video_dir / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_video(self, path: Path) -> np.ndarray:
+        if cv2 is None:
+            raise RuntimeError("OpenCV is required to read video data")
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():  # pragma: no cover - hardware dependent
+            raise RuntimeError(f"Unable to open video: {path}")
+        frames: List[np.ndarray] = []
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (self.frame_size, self.frame_size))
+            frames.append(frame.astype(np.float32) / 255.0)
+        capture.release()
+        if not frames:
+            raise RuntimeError(f"Video {path} did not contain readable frames")
+        arr = np.stack(frames, axis=0)  # (T, H, W, C)
+        arr = arr.transpose(0, 3, 1, 2)  # (T, C, H, W)
+        return arr
+
 
 # -----------------------------
-# Model: Keypoint encoder → temporal transformer → pooled z (1024)
+# Model definitions live in `slt.utils.visual_adapter`
 # -----------------------------
-@dataclass
-class AdapterConfig:
-    hidden_size: int = 1024
-    keypoint_hidden: int = 512
-    fusion_layers: int = 4
-    fusion_heads: int = 8
-    dropout: float = 0.1
-    keypoint_layers: int = 4
-    keypoint_heads: int = 8
-
-
-class _TransformerEncoder(nn.Module):
-    def __init__(self, d_model: int, *, num_layers: int, nhead: int, dropout: float) -> None:
-        super().__init__()
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer_norm(self.encoder(self.dropout(x)))
-
-
-class KeypointEncoder(nn.Module):
-    def __init__(self, config: AdapterConfig, num_points: int) -> None:
-        super().__init__()
-        input_dim = num_points * KEYPOINT_CHANNELS
-        self.proj = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, config.keypoint_hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.keypoint_hidden, config.keypoint_hidden),
-        )
-        self.temporal = _TransformerEncoder(
-            config.keypoint_hidden,
-            num_layers=config.keypoint_layers,
-            nhead=config.keypoint_heads,
-            dropout=config.dropout,
-        )
-
-    def forward(self, kp_btnc: torch.Tensor) -> torch.Tensor:
-        B, T, N, C = kp_btnc.shape
-        x = kp_btnc.reshape(B, T, N * C)
-        x = self.proj(x)
-        return self.temporal(x)  # [B,T,hidden]
-
-
-class FusionAdapter(nn.Module):
-    """Keypoint‑only adapter that outputs a pooled vector z in SONAR space (D=1024)."""
-
-    def __init__(self, config: AdapterConfig, num_points: int) -> None:
-        super().__init__()
-        self.kp_enc = KeypointEncoder(config, num_points)
-        self.kp_proj = nn.Linear(config.keypoint_hidden, config.hidden_size)
-        self.fusion = _TransformerEncoder(
-            config.hidden_size,
-            num_layers=config.fusion_layers,
-            nhead=config.fusion_heads,
-            dropout=config.dropout,
-        )
-        self.out_norm = nn.LayerNorm(config.hidden_size)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
-
-    def forward(self, kp_btnc: torch.Tensor) -> torch.Tensor:
-        kp = self.kp_enc(kp_btnc)                 # [B,T,H_k]
-        kp = self.kp_proj(kp)                     # [B,T,D]
-        fused = self.fusion(kp)                   # [B,T,D]
-        z = fused.mean(dim=1)                     # mean pooling (paper allows mean/attn)
-        z = self.out_norm(z)
-        return self.out_proj(z)                   # [B,D]
-
 
 # -----------------------------
 # Text encoder / pooling with SONAR HF port (M2M‑style mean pooling)
@@ -357,9 +346,12 @@ class TrainConfig:
     keypoints_dir: Path
     csv: Path
     out_dir: Path
+    video_dir: Optional[Path] = None
     model_name: str = "mtmlt/sonar-nllb-200-1.3B"
     tgt_lang: str = "spa_Latn"
     T: int = DEFAULT_T
+    clip_frames: int = DEFAULT_CLIP_FRAMES
+    frame_size: int = DEFAULT_IMG_SIZE
     batch_size: int = 8
     accum: int = 2
     epochs: int = 10
@@ -374,6 +366,13 @@ class TrainConfig:
     lam_sem: float = 1.0         # λ_sem
     lam_ce: float = 0.1          # λ_ce
     lam_ae: float = 0.2          # λ_ae
+    vit_model: str = "vit_base_patch16_224"
+    vit_checkpoint: Optional[Path] = None
+    videomae_model: str = "MCG-NJU/videomae-base"
+    videomae_checkpoint: Optional[Path] = None
+    freeze_keypoint: bool = False
+    freeze_vit: bool = False
+    freeze_videomae: bool = False
 
 
 def resolve_device(name: str) -> torch.device:
@@ -407,7 +406,17 @@ def train(cfg: TrainConfig) -> None:
             cfg.keypoints_dir = alt
 
     # Data
-    ds = KPTextDataset(cfg.keypoints_dir, cfg.csv, T=cfg.T)
+    if cfg.video_dir is not None and not cfg.video_dir.exists():
+        raise FileNotFoundError(f"Video directory not found: {cfg.video_dir}")
+
+    ds = KPTextDataset(
+        cfg.keypoints_dir,
+        cfg.csv,
+        T=cfg.T,
+        video_dir=cfg.video_dir,
+        clip_frames=cfg.clip_frames,
+        frame_size=cfg.frame_size,
+    )
     N = count_landmarks(ds[0]["keypoints"])  # landmarks
 
     # Model pieces
@@ -426,7 +435,17 @@ def train(cfg: TrainConfig) -> None:
     if cfg.half and device.type == "cuda":
         bridge.half()
 
-    adapter = FusionAdapter(AdapterConfig(), num_points=N).to(device)
+    adapter = VisualFusionAdapter(
+        AdapterConfig(),
+        num_points=N,
+        vit_name=cfg.vit_model,
+        vit_checkpoint=cfg.vit_checkpoint,
+        freeze_vit=cfg.freeze_vit,
+        videomae_name=cfg.videomae_model,
+        videomae_checkpoint=cfg.videomae_checkpoint,
+        freeze_videomae=cfg.freeze_videomae,
+        freeze_keypoint=cfg.freeze_keypoint,
+    ).to(device)
     if cfg.half and device.type == "cuda":
         adapter.half()
 
@@ -441,24 +460,37 @@ def train(cfg: TrainConfig) -> None:
         ids = [b["id"] for b in batch]
         texts = [b["text"] for b in batch]
         kps = torch.stack([b["keypoints"] for b in batch], dim=0)  # [B,T,N,C]
-        return ids, texts, kps
+        videos: Optional[torch.Tensor] = None
+        if batch[0]["video"] is not None:
+            videos = torch.stack([b["video"] for b in batch], dim=0)  # [B,TV,C,H,W]
+        return ids, texts, kps, videos
 
-    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=0, collate_fn=collate, pin_memory=(device.type=="cuda"))
+    dl = DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate,
+        pin_memory=(device.type == "cuda"),
+    )
 
     step = 0
     log_path = cfg.out_dir / "train_log.jsonl"
     accum_counter = 0
     for epoch in range(cfg.epochs):
         total_batches = len(dl)
-        for batch_idx, (ids, texts, kp) in enumerate(dl):
+        for batch_idx, (ids, texts, kp, video) in enumerate(dl):
             step += 1
             accum_counter += 1
             kp = kp.to(device)
+            frames_tensor: Optional[torch.Tensor] = None
+            if video is not None:
+                frames_tensor = video.to(device)
             kp = jitter_keypoints(kp, noise_std=0.04, drop_prob=0.2)
 
             with torch.amp.autocast("cuda", enabled=cfg.half and device.type == "cuda"):
                 # --- Visual → semantic vector z (Eq. 1–3)
-                z = adapter(kp)                # [B,1024]
+                z = adapter(kp, frames_tensor)                # [B,1024]
                 mem_z = bridge(z).unsqueeze(1) # [B,1,d_model]
 
                 # --- Text → sentence embedding s (Eq. 4 + SONAR pooling)
@@ -568,9 +600,12 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--keypoints-dir", type=Path, default=Path("single_signer/kp/keypoints"))
     ap.add_argument("--csv", type=Path, default=Path("meta_2.csv"))
     ap.add_argument("--out", type=Path, default=Path("runs/sonar_slt_finetune_lsa"))
+    ap.add_argument("--video-dir", type=Path, default=None)
     ap.add_argument("--model-name", type=str, default="mtmlt/sonar-nllb-200-1.3B")
     ap.add_argument("--tgt-lang", type=str, default="spa_Latn")
     ap.add_argument("--T", type=int, default=DEFAULT_T)
+    ap.add_argument("--clip-frames", type=int, default=DEFAULT_CLIP_FRAMES)
+    ap.add_argument("--frame-size", type=int, default=DEFAULT_IMG_SIZE)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=10)
@@ -585,14 +620,24 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--lam-sem", type=float, default=1.0)
     ap.add_argument("--lam-ce", type=float, default=0.1)
     ap.add_argument("--lam-ae", type=float, default=0.2)
+    ap.add_argument("--vit-model", type=str, default="vit_base_patch16_224")
+    ap.add_argument("--vit-checkpoint", type=Path, default=None)
+    ap.add_argument("--videomae-model", type=str, default="MCG-NJU/videomae-base")
+    ap.add_argument("--videomae-checkpoint", type=Path, default=None)
+    ap.add_argument("--freeze-keypoint", action="store_true")
+    ap.add_argument("--freeze-vit", action="store_true")
+    ap.add_argument("--freeze-videomae", action="store_true")
     args = ap.parse_args()
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
         csv=args.csv,
         out_dir=args.out,
+        video_dir=args.video_dir,
         model_name=args.model_name,
         tgt_lang=args.tgt_lang,
         T=args.T,
+        clip_frames=args.clip_frames,
+        frame_size=args.frame_size,
         batch_size=args.batch_size,
         accum=args.accum,
         epochs=args.epochs,
@@ -607,6 +652,13 @@ def parse_args() -> TrainConfig:
         lam_sem=args.lam_sem,
         lam_ce=args.lam_ce,
         lam_ae=args.lam_ae,
+        vit_model=args.vit_model,
+        vit_checkpoint=args.vit_checkpoint,
+        videomae_model=args.videomae_model,
+        videomae_checkpoint=args.videomae_checkpoint,
+        freeze_keypoint=bool(args.freeze_keypoint),
+        freeze_vit=bool(args.freeze_vit),
+        freeze_videomae=bool(args.freeze_videomae),
     )
 
 
