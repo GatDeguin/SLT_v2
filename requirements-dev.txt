@@ -1,0 +1,10 @@
+# Instalación editable del paquete con extras comunes
+# Nota: el extra "media" solo se instalará en Python <3.13.
+-e .[media,metrics,export]
+
+# Herramientas de pruebas y formato utilizadas en CI
+pytest>=7.4
+pytest-cov>=4.1
+black>=24.0
+ruff>=0.5.0
+mypy>=1.11

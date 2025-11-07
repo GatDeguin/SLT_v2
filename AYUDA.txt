@@ -1,0 +1,28 @@
+.\.venv\Scripts\Activate.ps1
+
+EXTRACCION:
+-----------
+
+python tools/extract_rois_v2.py `
+   --videos data/single_signer/videos `
+   --out data/single_signer/kp `
+   --format npz `
+   --streams face hands pose `
+   --metadata data/single_signer/metadata.jsonl `
+   --delegate cpu `
+   --fps-limit 15 `
+   --face-model .\models\face_landmarker.task `
+   --hand-model .\models\hand_landmarker.task `
+   --pose-model .\models\pose_landmarker_full.task `
+   --export-keypoints
+
+
+VISUALIZACION:
+--------------
+
+python tools/visualize_keypoints_viewer.py    --videos-dir data/single_signer/videos  --keypoints-dir data/single_signer/kp/keypoints --csv meta.csv
+
+
+ENTRENAMIENTO:
+--------------
+
