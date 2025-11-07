@@ -70,6 +70,10 @@ from transformers import (
 )
 from transformers.modeling_outputs import BaseModelOutput
 
+from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
+
+from models.text_pooler import TextPooler
+
 try:  # pragma: no cover - optional dependency
     import cv2
 except Exception:  # pragma: no cover - optional dependency
@@ -304,23 +308,6 @@ class KPTextDataset(Dataset):
 # -----------------------------
 # Text encoder / pooling with SONAR HF port (M2M‑style mean pooling)
 # -----------------------------
-class TextPooler:
-    def __init__(self, model: AutoModelForSeq2SeqLM, tokenizer: AutoTokenizer, lang: str):
-        self.model = model
-        self.tok = tokenizer
-        self.lang = lang
-
-    @torch.no_grad()
-    def encode(self, texts: List[str]) -> torch.Tensor:
-        """Mean‑pool encoder states → sentence embedding s (B, d_model)."""
-        self.tok.src_lang = self.lang
-        batch = self.tok(texts, return_tensors="pt", padding=True).to(self.model.device)
-        seq = self.model.model.encoder(**batch).last_hidden_state  # [B,S,d]
-        mask = batch.attention_mask
-        mean_emb = (seq * mask.unsqueeze(-1)).sum(1) / mask.unsqueeze(-1).sum(1)
-        return mean_emb  # (B,d)
-
-
 # -----------------------------
 # Augmentations (simple keypoint perturbations, coupled to target aug future‑proof)
 # -----------------------------
@@ -356,6 +343,8 @@ class TrainConfig:
     accum: int = 2
     epochs: int = 10
     lr: float = 3e-4
+    bridge_lr: Optional[float] = None
+    lora_lr: Optional[float] = None
     weight_decay: float = 0.01
     device: str = "auto"  # auto|cuda|cpu|mps
     half: bool = False
@@ -366,6 +355,7 @@ class TrainConfig:
     lam_sem: float = 1.0         # λ_sem
     lam_ce: float = 0.1          # λ_ce
     lam_ae: float = 0.2          # λ_ae
+    text_pool_layers: int = 4
     vit_model: str = "vit_base_patch16_224"
     vit_checkpoint: Optional[Path] = None
     videomae_model: str = "MCG-NJU/videomae-base"
@@ -421,13 +411,20 @@ def train(cfg: TrainConfig) -> None:
 
     # Model pieces
     device = resolve_device(cfg.device)
-    decoder = AutoModelForSeq2SeqLM.from_pretrained(cfg.model_name).to(device)
+    decoder = AutoModelForSeq2SeqLM.from_pretrained(cfg.model_name)
     tok = AutoTokenizer.from_pretrained(cfg.model_name)
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.SEQ_2_SEQ_LM,
+        target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+    )
+    decoder = get_peft_model(decoder, lora_config).to(device)
     if cfg.half and device.type == "cuda":
         decoder.half()
-    # Freeze decoder by default (PEFT spirit); only train adapter + bridge
-    for p in decoder.parameters():
-        p.requires_grad = False
 
     # Bridge maps adapter’s 1024 to decoder d_model if needed
     d_model = getattr(decoder.config, "d_model", None) or getattr(decoder.config, "hidden_size", DEFAULT_D_MODEL)
@@ -449,10 +446,29 @@ def train(cfg: TrainConfig) -> None:
     if cfg.half and device.type == "cuda":
         adapter.half()
 
-    text_pool = TextPooler(decoder, tok, cfg.tgt_lang)
+    text_pool = TextPooler(decoder, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)
 
     # Optimiser
-    opt = torch.optim.AdamW(list(adapter.parameters()) + list(bridge.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+    bridge_params = [p for p in bridge.parameters() if p.requires_grad]
+    lora_params = [p for p in decoder.parameters() if p.requires_grad]
+
+    lr_adapter = cfg.lr
+    lr_bridge = cfg.bridge_lr if cfg.bridge_lr is not None else cfg.lr
+    lr_lora = cfg.lora_lr if cfg.lora_lr is not None else cfg.lr
+
+    param_groups = []
+    if adapter_params:
+        param_groups.append({"params": adapter_params, "lr": lr_adapter})
+    if bridge_params:
+        param_groups.append({"params": bridge_params, "lr": lr_bridge})
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": lr_lora})
+
+    if not param_groups:
+        raise RuntimeError("No trainable parameters found for optimiser")
+
+    opt = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.half and device.type == "cuda")
 
     # Loader
@@ -562,6 +578,8 @@ def train(cfg: TrainConfig) -> None:
                 ckpt = {
                     "adapter": adapter.state_dict(),
                     "bridge": bridge.state_dict(),
+                    "lora": get_peft_model_state_dict(decoder),
+                    "lora_config": lora_config.to_dict(),
                     "config": cfg.__dict__,
                     "d_model": d_model,
                     "num_landmarks": N,
@@ -587,6 +605,8 @@ def train(cfg: TrainConfig) -> None:
     ckpt = {
         "adapter": adapter.state_dict(),
         "bridge": bridge.state_dict(),
+        "lora": get_peft_model_state_dict(decoder),
+        "lora_config": lora_config.to_dict(),
         "config": cfg.__dict__,
         "d_model": d_model,
         "num_landmarks": N,
@@ -610,6 +630,8 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--bridge-lr", type=float, default=None)
+    ap.add_argument("--lora-lr", type=float, default=None)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--half", action="store_true")
@@ -627,6 +649,7 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--freeze-keypoint", action="store_true")
     ap.add_argument("--freeze-vit", action="store_true")
     ap.add_argument("--freeze-videomae", action="store_true")
+    ap.add_argument("--text-pool-layers", type=int, default=4)
     args = ap.parse_args()
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
@@ -642,6 +665,8 @@ def parse_args() -> TrainConfig:
         accum=args.accum,
         epochs=args.epochs,
         lr=args.lr,
+        bridge_lr=args.bridge_lr,
+        lora_lr=args.lora_lr,
         weight_decay=args.weight_decay,
         device=args.device,
         half=bool(args.half),
@@ -652,6 +677,7 @@ def parse_args() -> TrainConfig:
         lam_sem=args.lam_sem,
         lam_ce=args.lam_ce,
         lam_ae=args.lam_ae,
+        text_pool_layers=args.text_pool_layers,
         vit_model=args.vit_model,
         vit_checkpoint=args.vit_checkpoint,
         videomae_model=args.videomae_model,

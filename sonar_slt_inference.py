@@ -53,6 +53,8 @@ from transformers import (
     M2M100ForConditionalGeneration,
 )
 
+from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict
+
 try:  # pragma: no cover - optional dependency
     import cv2
 except Exception:  # pragma: no cover - optional dependency
@@ -63,6 +65,8 @@ from slt.utils.visual_adapter import (
     KEYPOINT_CHANNELS,
     VisualFusionAdapter,
 )
+
+from models.text_pooler import TextPooler
 
 LOGGER = logging.getLogger("sonar_slt_inference")
 
@@ -235,6 +239,7 @@ def run_inference(
     samples: Sequence[Tuple[str, Optional[Path], Path]],
     generation_config: GenerationConfig,
     *,
+    forced_bos_id: int,
     device: torch.device,
     num_kp_frames: int,
     clip_frames: int,
@@ -281,7 +286,6 @@ def run_inference(
         with torch.inference_mode():
             embedding = adapter(kp_tensor, frames_tensor)
             encoder_outputs = BaseModelOutput(last_hidden_state=embedding.unsqueeze(1))
-            forced_bos_id = tokenizer.lang_code_to_id[generation_config.target_lang]
             generated = model.generate(
                 encoder_outputs=encoder_outputs,
                 forced_bos_token_id=forced_bos_id,
@@ -303,16 +307,42 @@ def run_inference(
     return results
 
 
-def _load_adapter_checkpoint(adapter: VisualFusionAdapter, checkpoint: Optional[Path]) -> None:
+def _load_adapter_checkpoint(
+    adapter: VisualFusionAdapter, checkpoint: Optional[Path]
+) -> Tuple[
+    Optional[Dict[str, torch.Tensor]],
+    Optional[Dict],
+    Optional[Dict[str, torch.Tensor]],
+    Optional[Dict],
+]:
     if checkpoint is None:
         LOGGER.warning("No adapter checkpoint provided; using random initialisation")
-        return
+        return None, None, None, None
+
     state_dict = torch.load(checkpoint, map_location="cpu")
     if isinstance(state_dict, dict) and "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
-    if isinstance(state_dict, dict) and "adapter" in state_dict:
-        state_dict = state_dict["adapter"]
-    adapter.load_state_dict(state_dict, strict=False)
+
+    adapter_state = state_dict
+    bridge_state: Optional[Dict[str, torch.Tensor]] = None
+    lora_state: Optional[Dict[str, torch.Tensor]] = None
+    lora_config: Optional[Dict] = None
+    train_config: Optional[Dict] = None
+
+    if isinstance(state_dict, dict):
+        if "adapter" in state_dict:
+            adapter_state = state_dict["adapter"]
+        if "bridge" in state_dict:
+            bridge_state = state_dict["bridge"]
+        if "lora" in state_dict:
+            lora_state = state_dict["lora"]
+        if "lora_config" in state_dict:
+            lora_config = state_dict["lora_config"]
+        if "config" in state_dict:
+            train_config = state_dict["config"]
+
+    adapter.load_state_dict(adapter_state, strict=False)
+    return lora_state, lora_config, bridge_state, train_config
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -466,11 +496,35 @@ def main(cli_args: Optional[Sequence[str]] = None) -> None:
         videomae_name=args.videomae_model,
         videomae_checkpoint=args.videomae_checkpoint,
     ).to(device)
-    _load_adapter_checkpoint(adapter, args.adapter_checkpoint)
+    lora_state, lora_config_dict, _bridge_state, train_config = _load_adapter_checkpoint(
+        adapter, args.adapter_checkpoint
+    )
 
     LOGGER.info("Loading SONAR decoder model: %s", args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = M2M100ForConditionalGeneration.from_pretrained(args.model_name).to(device)
+    model = M2M100ForConditionalGeneration.from_pretrained(args.model_name)
+    if lora_state is not None:
+        if lora_config_dict is not None:
+            lora_config = LoraConfig(**lora_config_dict)
+        else:
+            lora_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                task_type=TaskType.SEQ_2_SEQ_LM,
+                target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+            )
+        model = get_peft_model(model, lora_config)
+        set_peft_model_state_dict(model, lora_state)
+        LOGGER.info("Loaded LoRA weights into SONAR decoder")
+    model = model.to(device)
+    pool_layers = 4
+    if train_config is not None:
+        pool_layers = int(train_config.get("text_pool_layers", pool_layers))
+
+    text_pooler = TextPooler(model, tokenizer, args.target_lang, num_layers=pool_layers)
+
     if args.target_lang not in tokenizer.lang_code_to_id:
         raise ValueError(
             f"Target language '{args.target_lang}' is not supported by the tokenizer"
@@ -490,6 +544,7 @@ def main(cli_args: Optional[Sequence[str]] = None) -> None:
         samples,
         generation_config,
         device=device,
+        forced_bos_id=text_pooler.bos_id,
         num_kp_frames=args.num_keypoint_frames,
         clip_frames=args.clip_frames,
         clip_offset=args.clip_offset,
