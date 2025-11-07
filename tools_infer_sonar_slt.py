@@ -178,7 +178,10 @@ class ViTSpatial(nn.Module):
         → returns [B,T,D_s]
         """
         B, T, H, W, C = frames_bthwc.shape
-        x = frames_bthwc[..., ::-1].float() / 255.0  # BGR→RGB
+        # Torch tensors do not support negative strides ("::-1"), so flip the
+        # channel dimension explicitly to convert from BGR to RGB.
+        x = frames_bthwc.float().div(255.0)
+        x = x[..., [2, 1, 0]]  # BGR→RGB
         x = x.view(B * T, H, W, C).permute(0, 3, 1, 2)  # [BT,3,H,W]
         feats = self.vit(x)  # [BT, D]
         return feats.view(B, T, -1)
@@ -204,7 +207,8 @@ class SimpleMotion3D(nn.Module):
     @torch.no_grad()
     def forward(self, frames_bthwc: torch.Tensor) -> torch.Tensor:
         B, T, H, W, C = frames_bthwc.shape
-        x = frames_bthwc[..., ::-1].float() / 255.0  # to RGB
+        x = frames_bthwc.float().div(255.0)
+        x = x[..., [2, 1, 0]]  # BGR→RGB
         x = x.permute(0, 4, 1, 2, 3)  # [B,3,T,H,W]
         feats = self.conv3d(x)  # [B,128,T,1,1]
         feats = feats.squeeze(-1).squeeze(-1).permute(0, 2, 1)  # [B,T,128]
