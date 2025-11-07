@@ -288,13 +288,61 @@ class SonarDecoder:
         mem = self.bridge(z).unsqueeze(1)  # [B,1,d_model]
         enc_out = BaseModelOutput(last_hidden_state=mem)
 
-        lang_code_map = getattr(self.tok, "lang_code_to_id", None)
-        if not isinstance(lang_code_map, dict):
-            raise ValueError("Tokenizer does not expose a 'lang_code_to_id' mapping")
-        forced_bos_id = lang_code_map.get(tgt_lang)
+        def _resolve_lang_token_id(lang_code: str) -> Optional[int]:
+            lang_code_map = getattr(self.tok, "lang_code_to_id", None)
+            if isinstance(lang_code_map, dict) and lang_code in lang_code_map:
+                return lang_code_map[lang_code]
+
+            config_map = getattr(getattr(self.model, "config", None), "lang_code_to_id", None)
+            if isinstance(config_map, dict) and lang_code in config_map:
+                return config_map[lang_code]
+
+            lang_token_to_id = getattr(self.tok, "lang_token_to_id", None)
+            if callable(lang_token_to_id):
+                try:
+                    token_id = lang_token_to_id(lang_code)
+                except KeyError:
+                    token_id = None
+                if token_id is not None:
+                    return token_id
+
+            token_id = self.tok.convert_tokens_to_ids(lang_code)
+            if isinstance(token_id, int) and token_id != getattr(self.tok, "unk_token_id", None):
+                return token_id
+
+            additional_tokens = getattr(self.tok, "additional_special_tokens", None)
+            additional_ids = getattr(self.tok, "additional_special_tokens_ids", None)
+            if (
+                isinstance(additional_tokens, list)
+                and isinstance(additional_ids, list)
+                and len(additional_tokens) == len(additional_ids)
+            ):
+                try:
+                    idx = additional_tokens.index(lang_code)
+                except ValueError:
+                    pass
+                else:
+                    token_id = additional_ids[idx]
+                    if isinstance(token_id, int):
+                        return token_id
+
+            return None
+
+        forced_bos_id = _resolve_lang_token_id(tgt_lang)
         if forced_bos_id is None:
+            available_langs: List[str] = []
+            langs_attr = getattr(self.tok, "langs", None)
+            if isinstance(langs_attr, list):
+                available_langs = list(langs_attr)
+            else:
+                maybe_tokens = getattr(self.tok, "additional_special_tokens", None)
+                if isinstance(maybe_tokens, list):
+                    available_langs = [tok for tok in maybe_tokens if isinstance(tok, str)]
+
+            preview = ", ".join(sorted(available_langs)[:10]) if available_langs else "unknown"
             raise ValueError(
-                f"Target language '{tgt_lang}' not found in tokenizer lang_code_to_id mapping"
+                f"Unable to resolve token id for target language '{tgt_lang}'. "
+                f"Known languages (sample): {preview}"
             )
 
         gen_cfg = GenerationConfig(
