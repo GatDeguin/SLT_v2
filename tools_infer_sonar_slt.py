@@ -201,6 +201,7 @@ class FusionAdapter(nn.Module):
         super().__init__()
         self.kp_enc = KeypointEncoder(config, num_points)
         self.kp_proj = nn.Linear(config.keypoint_hidden, config.hidden_size)
+        self.keypoint_bias = nn.Parameter(torch.zeros(config.hidden_size))
         self.fusion = _TransformerEncoder(
             config.hidden_size,
             num_layers=config.fusion_layers,
@@ -213,6 +214,7 @@ class FusionAdapter(nn.Module):
     def forward(self, kp_btnc: torch.Tensor) -> torch.Tensor:
         kp = self.kp_enc(kp_btnc)                 # [B,T,H_k]
         kp = self.kp_proj(kp)                     # [B,T,D]
+        kp = kp + self.keypoint_bias.view(1, 1, -1)
         fused = self.fusion(kp)                   # [B,T,D]
         z = fused.mean(dim=1)                     # mean pooling
         z = self.out_norm(z)
@@ -436,6 +438,23 @@ class SonarSLTInference(nn.Module):
             raise TypeError("Adapter state must be a state dict mapping strings to tensors")
 
         state_dict: Dict[str, torch.Tensor] = dict(adapter_state)
+
+        def _extract_bias_candidate(value: Any) -> Optional[torch.Tensor]:
+            candidate = None
+            if hasattr(value, "ndim") and getattr(value, "ndim") and getattr(value, "ndim") >= 1:
+                try:
+                    candidate = value[0]
+                except Exception:  # pragma: no cover - defensive
+                    candidate = None
+            elif hasattr(value, "__getitem__"):
+                try:
+                    candidate = value[0]
+                except Exception:  # pragma: no cover - defensive
+                    candidate = None
+            return candidate
+
+        keypoint_bias_value: Optional[torch.Tensor] = None
+
         has_kp_proj = any(key.startswith("kp_proj.") for key in state_dict)
         has_fusion_key_proj = any(key.startswith("fusion.key_proj.") for key in state_dict)
 
@@ -452,10 +471,28 @@ class SonarSLTInference(nn.Module):
                     suffix = key.split(".", 2)[-1]
                     converted_state[f"kp_proj.{suffix}"] = value
                     continue
+                if key.startswith("fusion.modality_embeddings"):
+                    if keypoint_bias_value is None:
+                        keypoint_bias_value = _extract_bias_candidate(value)
+                    continue
                 if key.startswith(drop_prefixes):
                     continue
                 converted_state[key] = value
             state_dict = converted_state
+
+        modality_keys = [
+            key
+            for key in state_dict
+            if key == "fusion.modality_embeddings"
+            or key.startswith("fusion.modality_embeddings.")
+        ]
+        for key in modality_keys:
+            value = state_dict.pop(key)
+            if keypoint_bias_value is not None:
+                continue
+            candidate = _extract_bias_candidate(value)
+            if candidate is not None:
+                keypoint_bias_value = candidate
 
         expected_keys = set(self.fusion_adapter.state_dict().keys())
         filtered_state: Dict[str, torch.Tensor] = {}
@@ -465,6 +502,9 @@ class SonarSLTInference(nn.Module):
                 filtered_state[key] = value
             else:
                 filtered_out.append(key)
+
+        if keypoint_bias_value is not None:
+            filtered_state["keypoint_bias"] = keypoint_bias_value
 
         if filtered_out:
             print(

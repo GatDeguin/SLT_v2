@@ -128,16 +128,19 @@ class FakeFusionAdapter:
         self.missing = []
         self.unexpected = []
         self.kp_proj = types.SimpleNamespace(weight=None, bias=None)
+        self.keypoint_bias = None
         self._state_dict = {
             "kp_enc.some_weight": "existing_weight",
             "kp_proj.weight": "existing_kp_weight",
             "kp_proj.bias": "existing_kp_bias",
+            "keypoint_bias": "existing_bias",
         }
 
     def load_state_dict(self, state_dict, strict=False):
         self.received_state = dict(state_dict)
         self.kp_proj.weight = self.received_state.get("kp_proj.weight")
         self.kp_proj.bias = self.received_state.get("kp_proj.bias")
+        self.keypoint_bias = self.received_state.get("keypoint_bias")
         return self.missing, self.unexpected
 
     def state_dict(self):
@@ -180,7 +183,7 @@ def test_load_adapter_converts_visual_fusion_state(capsys):
         "kp_enc.some_weight": object(),
         "fusion.key_proj.weight": "weight_tensor",
         "fusion.key_proj.bias": "bias_tensor",
-        "fusion.modality_embeddings.weight": "ignore_me",
+        "fusion.modality_embeddings.weight": [[1, 2, 3], [4, 5, 6]],
         "fusion.spatial_proj.bias": "ignore_me_too",
         "fusion.motion_proj.weight": "ignore_me_three",
         "vit.encoder.layers.0.weight": "vit_tensor",
@@ -192,6 +195,7 @@ def test_load_adapter_converts_visual_fusion_state(capsys):
 
     assert fake_adapter.kp_proj.weight == "weight_tensor"
     assert fake_adapter.kp_proj.bias == "bias_tensor"
+    assert fake_adapter.keypoint_bias == [1, 2, 3]
     assert fake_adapter.received_state is not None
     assert "fusion.key_proj.weight" not in fake_adapter.received_state
     assert "fusion.modality_embeddings.weight" not in fake_adapter.received_state
@@ -201,3 +205,59 @@ def test_load_adapter_converts_visual_fusion_state(capsys):
     assert "videomae.encoder.layers.0.bias" not in fake_adapter.received_state
     assert "vit.encoder.layers.0.weight" in captured.out
     assert "videomae.encoder.layers.0.bias" in captured.out
+
+
+def test_fusion_adapter_forward_adds_keypoint_bias():
+    module = _import_module()
+
+    class DummyTensor:
+        def __init__(self, value):
+            self.value = value
+
+        def __add__(self, other):
+            other_value = getattr(other, "value", other)
+            return DummyTensor(self.value + other_value)
+
+        __radd__ = __add__
+
+        def mean(self, dim):
+            return DummyTensor(self.value)
+
+    class DummyBias:
+        def __init__(self, value):
+            self.value = value
+
+        def view(self, *shape):
+            return self
+
+    class DummyModule:
+        def __init__(self, result):
+            self._result = result
+
+        def __call__(self, *args, **kwargs):
+            return self._result
+
+    class DummyFusion:
+        def __init__(self):
+            self.received = None
+
+        def __call__(self, tensor):
+            self.received = tensor
+            return tensor
+
+    adapter = module.FusionAdapter.__new__(module.FusionAdapter)
+    encoded = DummyTensor(0)
+    projected = DummyTensor(0)
+    fusion = DummyFusion()
+
+    adapter.kp_enc = DummyModule(encoded)
+    adapter.kp_proj = DummyModule(projected)
+    adapter.keypoint_bias = DummyBias(7)
+    adapter.fusion = fusion
+    adapter.out_norm = lambda x: x
+    adapter.out_proj = lambda x: x
+
+    output = adapter.forward(object())
+
+    assert fusion.received.value == 7
+    assert output.value == 7
