@@ -487,7 +487,14 @@ def main():
         raise FileNotFoundError(f"Adapter checkpoint not found: {args.adapter_ckpt}")
     adapter_map_device = _resolve_device(args.adapter_device)
     if hasattr(torch.serialization, "add_safe_globals"):
-        torch.serialization.add_safe_globals([WindowsPath])
+        safe_globals = [WindowsPath]
+        try:
+            from peft.utils.peft_types import TaskType  # type: ignore
+        except Exception:  # pragma: no cover - best effort import for torch safe loading
+            TaskType = None
+        else:
+            safe_globals.append(TaskType)
+        torch.serialization.add_safe_globals(safe_globals)
     try:
         ckpt = torch.load(args.adapter_ckpt, map_location=adapter_map_device)
     except (RuntimeError, OSError, ValueError, EOFError) as exc:
