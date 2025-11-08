@@ -372,7 +372,30 @@ class SonarSLTInference(nn.Module):
     def load_adapter(self, adapter_state: Dict[str, torch.Tensor]) -> None:
         if not isinstance(adapter_state, dict):
             raise TypeError("Adapter state must be a state dict mapping strings to tensors")
-        missing, unexpected = self.fusion_adapter.load_state_dict(adapter_state, strict=False)
+
+        state_dict: Dict[str, torch.Tensor] = dict(adapter_state)
+        has_kp_proj = any(key.startswith("kp_proj.") for key in state_dict)
+        has_fusion_key_proj = any(key.startswith("fusion.key_proj.") for key in state_dict)
+
+        if not has_kp_proj and has_fusion_key_proj:
+            converted_state: Dict[str, torch.Tensor] = {}
+            drop_prefixes = (
+                "fusion.key_proj.",
+                "fusion.modality_embeddings",
+                "fusion.spatial_proj",
+                "fusion.motion_proj",
+            )
+            for key, value in state_dict.items():
+                if key.startswith("fusion.key_proj."):
+                    suffix = key.split(".", 2)[-1]
+                    converted_state[f"kp_proj.{suffix}"] = value
+                    continue
+                if key.startswith(drop_prefixes):
+                    continue
+                converted_state[key] = value
+            state_dict = converted_state
+
+        missing, unexpected = self.fusion_adapter.load_state_dict(state_dict, strict=False)
         if missing:
             raise RuntimeError(f"Adapter checkpoint is missing parameters: {sorted(missing)}")
         if unexpected:
