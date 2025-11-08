@@ -489,11 +489,11 @@ def main():
     if hasattr(torch.serialization, "add_safe_globals"):
         safe_globals = [WindowsPath]
         try:
-            from peft.utils.peft_types import TaskType  # type: ignore
+            from peft.utils.peft_types import TaskType, PeftType  # type: ignore
         except Exception:  # pragma: no cover - best effort import for torch safe loading
-            TaskType = None
+            TaskType = PeftType = None
         else:
-            safe_globals.append(TaskType)
+            safe_globals.extend([TaskType, PeftType])
         torch.serialization.add_safe_globals(safe_globals)
     try:
         ckpt = torch.load(args.adapter_ckpt, map_location=adapter_map_device)
