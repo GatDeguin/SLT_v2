@@ -37,10 +37,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path, WindowsPath
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -58,9 +59,21 @@ except Exception as exc:  # pragma: no cover
     print("[FATAL] transformers not available:", exc)
     raise
 
+try:  # pragma: no cover - optional dependency
+    from peft import LoraConfig, TaskType, get_peft_model, set_peft_model_state_dict
+except Exception:  # pragma: no cover - best effort import when PEFT is unavailable
+    LoraConfig = None  # type: ignore[assignment]
+    TaskType = None  # type: ignore[assignment]
+    get_peft_model = None  # type: ignore[assignment]
+    set_peft_model_state_dict = None  # type: ignore[assignment]
+
 # -----------------------------
 # Utilities
 # -----------------------------
+
+LOGGER = logging.getLogger("tools_infer_sonar_slt")
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(level=logging.INFO)
 
 KEYPOINT_CHANNELS = 3  # (x, y, conf)
 
@@ -219,6 +232,8 @@ class SonarDecoder:
         half: bool = False,
         *,
         d_model: Optional[int] = None,
+        lora_state: Optional[Dict[str, torch.Tensor]] = None,
+        lora_config: Optional[Dict[str, Any]] = None,
     ):
         self.device = device
         # Matches TrainConfig.model_name to ensure existing bridge checkpoints load without changes.
@@ -257,6 +272,53 @@ class SonarDecoder:
         )
         self.d_model = d_model or model_d_model
         self.bridge: Optional[nn.Linear] = None
+        self._lora_applied = False
+        self._apply_lora_if_available(lora_state, lora_config)
+
+    def _apply_lora_if_available(
+        self,
+        lora_state: Optional[Dict[str, torch.Tensor]],
+        lora_config: Optional[Dict[str, Any]],
+    ) -> None:
+        if lora_state is None:
+            if lora_config is not None:
+                LOGGER.warning(
+                    "LoRA config was provided without weights; skipping decoder LoRA application."
+                )
+            return
+        if get_peft_model is None or set_peft_model_state_dict is None or LoraConfig is None:
+            raise RuntimeError(
+                "LoRA weights were provided but the PEFT dependency is unavailable."
+            )
+        if not isinstance(lora_state, dict):
+            raise TypeError("LoRA state must be a state dict mapping parameter names to tensors")
+        if lora_config is not None and not isinstance(lora_config, dict):
+            raise TypeError("LoRA config must be a mapping when provided")
+        if lora_config is not None:
+            lora_cfg = LoraConfig(**lora_config)
+        else:
+            if TaskType is None:
+                raise RuntimeError(
+                    "LoRA weights were provided without a config and TaskType is unavailable."
+                )
+            LOGGER.info("LoRA config missing from checkpoint; using default SONAR settings.")
+            lora_cfg = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                task_type=TaskType.SEQ_2_SEQ_LM,
+                target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+            )
+        LOGGER.info("Initialising SONAR decoder with LoRA adapters.")
+        self.model = get_peft_model(self.model, lora_cfg)
+        set_peft_model_state_dict(self.model, lora_state)
+        self.model = self.model.to(self.device)
+        if self._use_half:
+            self.model.half()
+        self.model.eval()
+        self._lora_applied = True
+        LOGGER.info("Loaded LoRA weights into SONAR decoder.")
 
     def load_bridge(self, bridge_state: Dict[str, torch.Tensor]) -> None:
         if not isinstance(bridge_state, dict):
@@ -552,6 +614,27 @@ def main():
     if not isinstance(adapter_state, dict) or not isinstance(bridge_state, dict):
         raise TypeError("Checkpoint keys 'adapter' and 'bridge' must be state dicts")
 
+    lora_state = ckpt.get("lora")
+    lora_config_dict = ckpt.get("lora_config")
+    if lora_state is not None and not isinstance(lora_state, dict):
+        raise TypeError("Checkpoint key 'lora' must be a state dict when present")
+    if lora_config_dict is not None and not isinstance(lora_config_dict, dict):
+        raise TypeError("Checkpoint key 'lora_config' must be a mapping when present")
+    if lora_state is None:
+        if lora_config_dict is not None:
+            LOGGER.warning(
+                "LoRA config found in checkpoint but no weights were provided; config will be ignored."
+            )
+            lora_config_dict = None
+        else:
+            LOGGER.info("No LoRA weights found in checkpoint; using base SONAR decoder.")
+    else:
+        LOGGER.info("LoRA weights detected in checkpoint.")
+        if lora_config_dict is None:
+            LOGGER.warning(
+                "LoRA weights detected without a config; falling back to default SONAR LoRA settings."
+            )
+
     num_landmarks = int(ckpt.get("num_landmarks") or 0)
     if num_landmarks <= 0:
         raise ValueError("Checkpoint missing a valid 'num_landmarks'")
@@ -570,6 +653,8 @@ def main():
         device=device,
         half=args.half,
         d_model=d_model,
+        lora_state=lora_state,
+        lora_config=lora_config_dict,
     )
     decoder.load_bridge(bridge_state)
 
