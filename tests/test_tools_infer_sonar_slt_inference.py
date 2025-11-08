@@ -128,12 +128,20 @@ class FakeFusionAdapter:
         self.missing = []
         self.unexpected = []
         self.kp_proj = types.SimpleNamespace(weight=None, bias=None)
+        self._state_dict = {
+            "kp_enc.some_weight": "existing_weight",
+            "kp_proj.weight": "existing_kp_weight",
+            "kp_proj.bias": "existing_kp_bias",
+        }
 
     def load_state_dict(self, state_dict, strict=False):
         self.received_state = dict(state_dict)
         self.kp_proj.weight = self.received_state.get("kp_proj.weight")
         self.kp_proj.bias = self.received_state.get("kp_proj.bias")
         return self.missing, self.unexpected
+
+    def state_dict(self):
+        return dict(self._state_dict)
 
 
 _defused = False
@@ -162,7 +170,7 @@ def _import_module():
     return module
 
 
-def test_load_adapter_converts_visual_fusion_state():
+def test_load_adapter_converts_visual_fusion_state(capsys):
     module = _import_module()
     fake_adapter = FakeFusionAdapter()
     instance = module.SonarSLTInference.__new__(module.SonarSLTInference)
@@ -175,9 +183,12 @@ def test_load_adapter_converts_visual_fusion_state():
         "fusion.modality_embeddings.weight": "ignore_me",
         "fusion.spatial_proj.bias": "ignore_me_too",
         "fusion.motion_proj.weight": "ignore_me_three",
+        "vit.encoder.layers.0.weight": "vit_tensor",
+        "videomae.encoder.layers.0.bias": "videomae_tensor",
     }
 
     instance.load_adapter(adapter_state)
+    captured = capsys.readouterr()
 
     assert fake_adapter.kp_proj.weight == "weight_tensor"
     assert fake_adapter.kp_proj.bias == "bias_tensor"
@@ -186,3 +197,7 @@ def test_load_adapter_converts_visual_fusion_state():
     assert "fusion.modality_embeddings.weight" not in fake_adapter.received_state
     assert "fusion.spatial_proj.bias" not in fake_adapter.received_state
     assert "fusion.motion_proj.weight" not in fake_adapter.received_state
+    assert "vit.encoder.layers.0.weight" not in fake_adapter.received_state
+    assert "videomae.encoder.layers.0.bias" not in fake_adapter.received_state
+    assert "vit.encoder.layers.0.weight" in captured.out
+    assert "videomae.encoder.layers.0.bias" in captured.out
