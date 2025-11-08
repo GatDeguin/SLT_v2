@@ -395,11 +395,29 @@ class SonarSLTInference(nn.Module):
                 converted_state[key] = value
             state_dict = converted_state
 
-        missing, unexpected = self.fusion_adapter.load_state_dict(state_dict, strict=False)
+        expected_keys = set(self.fusion_adapter.state_dict().keys())
+        filtered_state: Dict[str, torch.Tensor] = {}
+        filtered_out: List[str] = []
+        for key, value in state_dict.items():
+            if key in expected_keys:
+                filtered_state[key] = value
+            else:
+                filtered_out.append(key)
+
+        if filtered_out:
+            print(
+                "[info] Ignoring adapter parameters not used during inference: "
+                f"{sorted(filtered_out)}"
+            )
+
+        missing, unexpected = self.fusion_adapter.load_state_dict(filtered_state, strict=False)
         if missing:
             raise RuntimeError(f"Adapter checkpoint is missing parameters: {sorted(missing)}")
         if unexpected:
-            raise RuntimeError(f"Adapter checkpoint has unexpected parameters: {sorted(unexpected)}")
+            print(
+                "[warn] Adapter checkpoint has additional parameters even after filtering: "
+                f"{sorted(unexpected)}"
+            )
 
     @torch.no_grad()
     def forward(self, keypoints_btnc: torch.Tensor) -> torch.Tensor:
