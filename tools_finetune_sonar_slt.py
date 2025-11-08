@@ -415,16 +415,21 @@ class TrainConfig:
 
 
 def resolve_device(name: str) -> torch.device:
-    name = name.strip().lower()
-    if name == "auto":
+    raw_name = name.strip()
+    lowered = raw_name.lower()
+    if lowered == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    if name in {"cuda", "gpu"} and torch.cuda.is_available():
+    try:
+        return torch.device(raw_name)
+    except (TypeError, RuntimeError, ValueError, AttributeError):
+        pass
+    if lowered in {"cuda", "gpu"} and torch.cuda.is_available():
         return torch.device("cuda")
-    if name == "mps" and torch.backends.mps.is_available():
+    if lowered == "mps" and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -726,7 +731,15 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--bridge-lr", type=float, default=None)
     ap.add_argument("--lora-lr", type=float, default=None)
     ap.add_argument("--weight-decay", type=float, default=0.01)
-    ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help=(
+            "Compute device (e.g. 'auto', 'cpu', 'cpu:0', 'cuda', 'cuda:1', 'mps'). "
+            "When set to 'auto', CUDA is preferred, then MPS, then CPU."
+        ),
+    )
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=50)

@@ -57,6 +57,35 @@ def _ensure_torch_stub():
 
     torch.from_numpy = _from_numpy
 
+    class _Device:
+        def __init__(self, spec):
+            self._spec = spec
+            if ":" in spec:
+                type_part, idx = spec.split(":", 1)
+                self.type = type_part.lower()
+                try:
+                    self.index = int(idx)
+                except ValueError:
+                    self.index = idx
+            else:
+                self.type = spec.lower()
+                self.index = None
+
+        def __repr__(self):
+            return f"device(type='{self.type}', index={self.index})"
+
+        def __str__(self):
+            return self._spec
+
+        def __eq__(self, other):
+            if isinstance(other, _Device):
+                return self._spec == other._spec
+            if isinstance(other, str):
+                return self._spec == other
+            return False
+
+    torch.device = lambda spec: _Device(spec)
+
     torch.stack = lambda tensors, dim=0: tensors
     torch.randn_like = lambda tensor: tensor
     torch.rand = lambda *args, **kwargs: 0
@@ -175,3 +204,23 @@ def test_read_meta_csv_prefers_semicolon_header(tmp_path):
     assert len(rows) == 1
     assert rows[0].vid == "clip_001"
     assert rows[0].text == "estamos en noviembre, y reflexionaba."
+
+
+def test_resolve_device_accepts_indexed_cuda():
+    _ensure_torch_stub()
+    _ensure_numpy_stub()
+    _ensure_transformers_stub()
+
+    module_path = Path(__file__).resolve().parent.parent / "tools_finetune_sonar_slt.py"
+    spec = importlib.util.spec_from_file_location("tools_finetune_sonar_slt", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["tools_finetune_sonar_slt"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    module.torch.cuda.is_available = lambda: True
+
+    device = module.resolve_device("cuda:1")
+
+    assert device.type == "cuda"
+    assert device.index == 1
