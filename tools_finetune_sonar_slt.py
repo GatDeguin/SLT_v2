@@ -142,6 +142,13 @@ except Exception:  # pragma: no cover - keep training usable without dataset ext
     _resolve_mediapipe_connections = None  # type: ignore[assignment]
     _resolve_mediapipe_layout = None  # type: ignore[assignment]
 
+from sonar_generation import generate_from_hidden_states
+from tools_eval_sonar_slt import (
+    DEFAULT_METRICS,
+    Example as EvalExample,
+    compute_metrics as eval_compute_metrics,
+)
+
 # -----------------------------
 # Constants / Layout helpers
 # -----------------------------
@@ -574,6 +581,10 @@ class TrainConfig:
     preview_height: int = 640
     preview_confidence_threshold: float = 0.2
     preview_seed: int = 1337
+    sample_metrics: Tuple[str, ...] = DEFAULT_METRICS
+    sample_max_new_tokens: int = 64
+    sample_num_beams: int = 4
+    sample_metrics_lowercase: bool = False
 
 
 def _cuda_is_available() -> bool:
@@ -624,6 +635,55 @@ def resolve_device(name: str) -> torch.device:
 def count_landmarks(example: torch.Tensor) -> int:
     # heuristic to infer N from single example (T, N, C)
     return int(example.shape[1])
+
+
+def _generate_sample_prediction(
+    sample: Dict[str, object],
+    *,
+    adapter: nn.Module,
+    bridge: nn.Module,
+    decoder: nn.Module,
+    tokenizer,
+    device: torch.device,
+    cfg: TrainConfig,
+) -> str:
+    modules: List[nn.Module] = [adapter, bridge, decoder]
+    prev_training_states = [module.training for module in modules]
+    for module in modules:
+        module.eval()
+
+    try:
+        with torch.no_grad():
+            kp_tensor = sample["keypoints"]
+            if not isinstance(kp_tensor, torch.Tensor):
+                raise TypeError("Sample is missing keypoints tensor for preview generation")
+            kp_tensor = kp_tensor.unsqueeze(0).to(device)
+
+            video_tensor = sample.get("video") if isinstance(sample, dict) else None
+            frames_tensor: Optional[torch.Tensor] = None
+            if isinstance(video_tensor, torch.Tensor):
+                frames_tensor = video_tensor.unsqueeze(0).to(device)
+
+            z = adapter(kp_tensor, frames_tensor)
+            z = z.to(bridge.weight.device)
+            z = z.to(bridge.weight.dtype)
+            mem = bridge(z).unsqueeze(1)
+
+            tokenizer.src_lang = cfg.tgt_lang
+            outputs = generate_from_hidden_states(
+                decoder,
+                tokenizer,
+                mem,
+                cfg.tgt_lang,
+                max_new_tokens=cfg.sample_max_new_tokens,
+                num_beams=cfg.sample_num_beams,
+            )
+            if not outputs:
+                return ""
+            return outputs[0]
+    finally:
+        for module, was_training in zip(modules, prev_training_states):
+            module.train(was_training)
 
 
 def train(cfg: TrainConfig) -> None:
@@ -884,63 +944,148 @@ def train(cfg: TrainConfig) -> None:
                 print(f"[ckpt] Saved {path}")
                 if cfg.save_samples:
                     preview_dir = cfg.out_dir / "checkpoints" / f"adapter_step{step:06d}" / "preview"
-                    with torch.no_grad():
-                        preview_dir.mkdir(parents=True, exist_ok=True)
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        sample_idx = preview_rng.randrange(len(ds))
+                        sample = ds[sample_idx]
+                    except Exception as exc:  # pragma: no cover - sampling is best-effort
+                        print(f"[preview] Failed to sample example: {exc}")
+                        sample = None
+
+                    if sample is not None:
+                        reference_path = preview_dir / "reference.txt"
+                        sample_text = str(sample["text"]) if isinstance(sample, dict) else str(sample)
+                        reference_text = f"id: {sample['id']}\ntext: {sample_text}\n"
+                        reference_path.write_text(reference_text, encoding="utf-8")
+                        print(f"[preview] Saved reference text → {reference_path}")
+                        if cv2 is None:
+                            print("[preview] OpenCV not available; skipped keypoints.png generation.")
+                        else:
+                            try:
+                                kp_tensor = sample["keypoints"].detach().cpu().numpy()
+                                total_frames = kp_tensor.shape[0]
+                                if total_frames <= 0:
+                                    raise ValueError("Sample contained no keypoint frames")
+                                frame_conf = kp_tensor[..., 2] if kp_tensor.shape[-1] > 2 else np.ones(
+                                    kp_tensor.shape[:2], dtype=np.float32
+                                )
+                                frame_scores = frame_conf.mean(axis=1)
+                                frame_idx = int(np.argmax(frame_scores)) if frame_scores.size else 0
+                                frame_idx = max(0, min(frame_idx, total_frames - 1))
+                                kp_frame = kp_tensor[frame_idx]
+
+                                video_frame: Optional[np.ndarray] = None
+                                video_tensor = sample.get("video") if isinstance(sample, dict) else None
+                                if video_tensor is not None:
+                                    if isinstance(video_tensor, torch.Tensor):
+                                        video_np = video_tensor.detach().cpu().numpy()
+                                    else:
+                                        video_np = np.asarray(video_tensor)
+                                    if video_np.shape[0] == 0:
+                                        raise ValueError("Sample video contained no frames")
+                                    frame_idx_vid = max(0, min(frame_idx, video_np.shape[0] - 1))
+                                    video_frame = video_np[frame_idx_vid]
+
+                                image = _render_keypoint_preview(
+                                    kp_frame,
+                                    layout=layout,
+                                    connections=connections,
+                                    width=cfg.preview_width,
+                                    height=cfg.preview_height,
+                                    confidence_threshold=cfg.preview_confidence_threshold,
+                                    text=f"{sample['id']}: {sample['text']}",
+                                    video_frame=video_frame,
+                                )
+                                image_path = preview_dir / "keypoints.png"
+                                cv2.imwrite(str(image_path), image)
+                                print(f"[preview] Saved sample preview → {image_path}")
+                            except Exception as exc:  # pragma: no cover - preview errors are non fatal
+                                print(f"[preview] Failed to render keypoint preview: {exc}")
+
+                        hypothesis: Optional[str] = None
+                        hypothesis_error: Optional[str] = None
                         try:
-                            sample_idx = preview_rng.randrange(len(ds))
-                            sample = ds[sample_idx]
-                        except Exception as exc:  # pragma: no cover - sampling is best-effort
-                            print(f"[preview] Failed to sample example: {exc}")
-                            sample = None
+                            hypothesis = _generate_sample_prediction(
+                                sample,
+                                adapter=adapter,
+                                bridge=bridge,
+                                decoder=decoder,
+                                tokenizer=tok,
+                                device=device,
+                                cfg=cfg,
+                            )
+                        except Exception as exc:
+                            hypothesis_error = str(exc)
+                            print(f"[preview] Failed to generate sample hypothesis: {exc}")
+                        metrics_dir_payload: Dict[str, object] = {}
+                        metrics_values: Dict[str, float] = {}
+                        metrics_path = preview_dir / "metrics.json"
+                        if hypothesis is not None:
+                            metrics_dir_payload = {
+                                "id": str(sample["id"]),
+                                "reference": sample_text,
+                                "hypothesis": hypothesis,
+                                "settings": {
+                                    "max_new_tokens": cfg.sample_max_new_tokens,
+                                    "num_beams": cfg.sample_num_beams,
+                                    "lowercase": cfg.sample_metrics_lowercase,
+                                    "metrics": list(cfg.sample_metrics),
+                                },
+                            }
 
-                        if sample is not None:
-                            reference_path = preview_dir / "reference.txt"
-                            reference_text = f"id: {sample['id']}\ntext: {sample['text']}\n"
-                            reference_path.write_text(reference_text, encoding="utf-8")
-                            print(f"[preview] Saved reference text → {reference_path}")
-                            if cv2 is None:
-                                print("[preview] OpenCV not available; skipped keypoints.png generation.")
-                            else:
+                            reference_for_metrics = metrics_dir_payload["reference"]
+                            prediction_for_metrics = hypothesis
+                            if cfg.sample_metrics_lowercase:
+                                reference_for_metrics = reference_for_metrics.lower()
+                                prediction_for_metrics = prediction_for_metrics.lower()
+
+                            if cfg.sample_metrics:
                                 try:
-                                    kp_tensor = sample["keypoints"].detach().cpu().numpy()
-                                    total_frames = kp_tensor.shape[0]
-                                    if total_frames <= 0:
-                                        raise ValueError("Sample contained no keypoint frames")
-                                    frame_conf = kp_tensor[..., 2] if kp_tensor.shape[-1] > 2 else np.ones(
-                                        kp_tensor.shape[:2], dtype=np.float32
+                                    metrics_values = eval_compute_metrics(
+                                        [
+                                            EvalExample(
+                                                clip_id=str(sample["id"]),
+                                                reference=reference_for_metrics,
+                                                prediction=prediction_for_metrics,
+                                            )
+                                        ],
+                                        cfg.sample_metrics,
                                     )
-                                    frame_scores = frame_conf.mean(axis=1)
-                                    frame_idx = int(np.argmax(frame_scores)) if frame_scores.size else 0
-                                    frame_idx = max(0, min(frame_idx, total_frames - 1))
-                                    kp_frame = kp_tensor[frame_idx]
-
-                                    video_frame: Optional[np.ndarray] = None
-                                    video_tensor = sample.get("video") if isinstance(sample, dict) else None
-                                    if video_tensor is not None:
-                                        if isinstance(video_tensor, torch.Tensor):
-                                            video_np = video_tensor.detach().cpu().numpy()
-                                        else:
-                                            video_np = np.asarray(video_tensor)
-                                        if video_np.shape[0] == 0:
-                                            raise ValueError("Sample video contained no frames")
-                                        frame_idx_vid = max(0, min(frame_idx, video_np.shape[0] - 1))
-                                        video_frame = video_np[frame_idx_vid]
-
-                                    image = _render_keypoint_preview(
-                                        kp_frame,
-                                        layout=layout,
-                                        connections=connections,
-                                        width=cfg.preview_width,
-                                        height=cfg.preview_height,
-                                        confidence_threshold=cfg.preview_confidence_threshold,
-                                        text=f"{sample['id']}: {sample['text']}",
-                                        video_frame=video_frame,
-                                    )
-                                    image_path = preview_dir / "keypoints.png"
-                                    cv2.imwrite(str(image_path), image)
-                                    print(f"[preview] Saved sample preview → {image_path}")
-                                except Exception as exc:  # pragma: no cover - preview errors are non fatal
-                                    print(f"[preview] Failed to render keypoint preview: {exc}")
+                                except Exception as exc:
+                                    print(f"[preview] Failed to compute metrics: {exc}")
+                                else:
+                                    metrics_dir_payload["metrics"] = metrics_values
+                                    summary = ", ".join(f"{name}={value:.4f}" for name, value in metrics_values.items())
+                                    if summary:
+                                        print(f"[preview] Metrics → {summary}")
+                                    else:
+                                        print("[preview] Metrics → (none computed)")
+                            else:
+                                print("[preview] Metrics → (disabled)")
+                            if "metrics" not in metrics_dir_payload:
+                                metrics_dir_payload["metrics"] = metrics_values
+                            metrics_path.write_text(
+                                json.dumps(metrics_dir_payload, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8",
+                            )
+                            print(f"[preview] Saved metrics → {metrics_path}")
+                        else:
+                            failure_payload = {
+                                "id": str(sample["id"]),
+                                "reference": sample_text,
+                                "error": hypothesis_error or "empty hypothesis",
+                                "settings": {
+                                    "max_new_tokens": cfg.sample_max_new_tokens,
+                                    "num_beams": cfg.sample_num_beams,
+                                    "lowercase": cfg.sample_metrics_lowercase,
+                                    "metrics": list(cfg.sample_metrics),
+                                },
+                            }
+                            metrics_path.write_text(
+                                json.dumps(failure_payload, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8",
+                            )
+                            print(f"[preview] Saved metrics (generation failed) → {metrics_path}")
 
         if accum_counter != 0:
             scaler.step(opt)
@@ -1029,6 +1174,33 @@ def parse_args() -> TrainConfig:
         default=1337,
         help="Random seed used to pick preview samples",
     )
+    ap.add_argument(
+        "--sample-metrics",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Metrics to compute for saved preview samples. "
+            "Defaults to tools_eval_sonar_slt.DEFAULT_METRICS when omitted."
+        ),
+    )
+    ap.add_argument(
+        "--sample-max-new-tokens",
+        type=int,
+        default=64,
+        help="Maximum number of tokens to generate for preview hypotheses",
+    )
+    ap.add_argument(
+        "--sample-num-beams",
+        type=int,
+        default=4,
+        help="Number of beams to use when generating preview hypotheses",
+    )
+    ap.add_argument(
+        "--sample-metrics-lowercase",
+        action="store_true",
+        help="Lowercase preview references and hypotheses before computing metrics",
+    )
     args = ap.parse_args()
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
@@ -1071,6 +1243,14 @@ def parse_args() -> TrainConfig:
         preview_height=int(args.preview_height),
         preview_confidence_threshold=float(args.preview_confidence_threshold),
         preview_seed=int(args.preview_seed),
+        sample_metrics=(
+            tuple(args.sample_metrics)
+            if args.sample_metrics is not None
+            else DEFAULT_METRICS
+        ),
+        sample_max_new_tokens=int(args.sample_max_new_tokens),
+        sample_num_beams=int(args.sample_num_beams),
+        sample_metrics_lowercase=bool(args.sample_metrics_lowercase),
     )
 
 

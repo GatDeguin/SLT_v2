@@ -53,9 +53,7 @@ try:
         AutoTokenizer,
         AutoModelForSeq2SeqLM,
         PreTrainedModel,
-        GenerationConfig,
     )
-    from transformers.modeling_outputs import BaseModelOutput
 except Exception as exc:  # pragma: no cover
     print("[FATAL] transformers not available:", exc)
     raise
@@ -67,6 +65,8 @@ except Exception:  # pragma: no cover - best effort import when PEFT is unavaila
     TaskType = None  # type: ignore[assignment]
     get_peft_model = None  # type: ignore[assignment]
     set_peft_model_state_dict = None  # type: ignore[assignment]
+
+from sonar_generation import generate_from_hidden_states
 
 # -----------------------------
 # Utilities
@@ -423,79 +423,14 @@ class SonarDecoder:
         z = z_bD.to(self.bridge.weight.device)
         z = z.to(self.bridge.weight.dtype)
         mem = self.bridge(z).unsqueeze(1)  # [B,1,d_model]
-        enc_out = BaseModelOutput(last_hidden_state=mem)
-
-        def _resolve_lang_token_id(lang_code: str) -> Optional[int]:
-            lang_code_map = getattr(self.tok, "lang_code_to_id", None)
-            if isinstance(lang_code_map, dict) and lang_code in lang_code_map:
-                return lang_code_map[lang_code]
-
-            config_map = getattr(getattr(self.model, "config", None), "lang_code_to_id", None)
-            if isinstance(config_map, dict) and lang_code in config_map:
-                return config_map[lang_code]
-
-            lang_token_to_id = getattr(self.tok, "lang_token_to_id", None)
-            if callable(lang_token_to_id):
-                try:
-                    token_id = lang_token_to_id(lang_code)
-                except KeyError:
-                    token_id = None
-                if token_id is not None:
-                    return token_id
-
-            token_id = self.tok.convert_tokens_to_ids(lang_code)
-            if isinstance(token_id, int) and token_id != getattr(self.tok, "unk_token_id", None):
-                return token_id
-
-            additional_tokens = getattr(self.tok, "additional_special_tokens", None)
-            additional_ids = getattr(self.tok, "additional_special_tokens_ids", None)
-            if (
-                isinstance(additional_tokens, list)
-                and isinstance(additional_ids, list)
-                and len(additional_tokens) == len(additional_ids)
-            ):
-                try:
-                    idx = additional_tokens.index(lang_code)
-                except ValueError:
-                    pass
-                else:
-                    token_id = additional_ids[idx]
-                    if isinstance(token_id, int):
-                        return token_id
-
-            return None
-
-        forced_bos_id = _resolve_lang_token_id(tgt_lang)
-        if forced_bos_id is None:
-            available_langs: List[str] = []
-            langs_attr = getattr(self.tok, "langs", None)
-            if isinstance(langs_attr, list):
-                available_langs = list(langs_attr)
-            else:
-                maybe_tokens = getattr(self.tok, "additional_special_tokens", None)
-                if isinstance(maybe_tokens, list):
-                    available_langs = [tok for tok in maybe_tokens if isinstance(tok, str)]
-
-            preview = ", ".join(sorted(available_langs)[:10]) if available_langs else "unknown"
-            raise ValueError(
-                f"Unable to resolve token id for target language '{tgt_lang}'. "
-                f"Known languages (sample): {preview}"
-            )
-
-        gen_cfg = GenerationConfig(
+        return generate_from_hidden_states(
+            self.model,
+            self.tok,
+            mem,
+            tgt_lang,
             max_new_tokens=max_new_tokens,
             num_beams=num_beams,
-            do_sample=False,
-            forced_bos_token_id=forced_bos_id,
-            decoder_start_token_id=forced_bos_id,
-            use_cache=True,
         )
-        outputs = self.model.generate(
-            encoder_outputs=enc_out,
-            decoder_input_ids=None,
-            generation_config=gen_cfg,
-        )
-        return self.tok.batch_decode(outputs, skip_special_tokens=True)
 
 
 # -----------------------------
