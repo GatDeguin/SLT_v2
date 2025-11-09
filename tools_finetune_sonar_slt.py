@@ -111,6 +111,13 @@ except Exception:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # pragma: no cover - optional dependency
+    Image = None  # type: ignore[assignment]
+    ImageDraw = None  # type: ignore[assignment]
+    ImageFont = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency
     from slt.utils.visual_adapter import (
         AdapterConfig,
         KEYPOINT_CHANNELS as ADAPTER_KEYPOINT_CHANNELS,
@@ -474,40 +481,102 @@ def _render_keypoint_preview(
         cv2.circle(canvas, tuple(points[idx]), 2, (255, 255, 255), -1, cv2.LINE_AA)
 
     if text:
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6
-        thickness = 2
         max_width = width - 20
+        if Image is not None and ImageDraw is not None and ImageFont is not None:
+            rgb_canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(rgb_canvas)
+            draw = ImageDraw.Draw(image)
 
-        def _wrap(line: str) -> List[str]:
-            words = line.split()
-            if not words:
-                return [""]
-            lines: List[str] = []
-            current: List[str] = []
-            for word in words:
-                tentative = " ".join(current + [word])
-                size, _ = cv2.getTextSize(tentative, font, font_scale, thickness)
-                if size[0] <= max_width or not current:
-                    current.append(word)
+            font_size = 20
+            font_path = Path(__file__).resolve().parent / "fonts" / "DejaVuSans.ttf"
+            try:
+                font = ImageFont.truetype(str(font_path), size=font_size)
+            except (OSError, IOError):  # pragma: no cover - optional font dependency
+                font = ImageFont.load_default()
+
+            def _wrap(line: str) -> List[str]:
+                words = line.split()
+                if not words:
+                    return [""]
+                lines: List[str] = []
+                current: List[str] = []
+                for word in words:
+                    tentative = " ".join(current + [word])
+                    width_px = draw.textlength(tentative, font=font)
+                    if width_px <= max_width or not current:
+                        current.append(word)
+                        continue
+                    lines.append(" ".join(current))
+                    current = [word]
+                if current:
+                    lines.append(" ".join(current))
+                return lines
+
+            lines = []
+            for raw_line in str(text).splitlines():
+                lines.extend(_wrap(raw_line.strip()))
+
+            try:
+                ascent, descent = font.getmetrics()
+                line_height = ascent + descent
+            except (AttributeError, TypeError):
+                line_height = getattr(font, "size", font_size)
+            line_height = max(int(line_height), 16)
+            line_gap = max(12, int(line_height * 0.3))
+            blank_gap = max(18, int(line_height * 0.6))
+
+            y = 24
+            for line in lines:
+                if not line:
+                    y += blank_gap
                     continue
-                lines.append(" ".join(current))
-                current = [word]
-            if current:
-                lines.append(" ".join(current))
-            return lines
+                draw.text((10, y), line, font=font, fill=(255, 255, 255))
+                y += line_height + line_gap
 
-        lines = []
-        for raw_line in str(text).splitlines():
-            lines.extend(_wrap(raw_line.strip()))
+            canvas = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        else:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
 
-        y = 24
-        for line in lines:
-            if not line:
-                y += 18
-                continue
-            cv2.putText(canvas, line, (10, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-            y += int(18 * font_scale) + 12
+            def _wrap(line: str) -> List[str]:
+                words = line.split()
+                if not words:
+                    return [""]
+                lines: List[str] = []
+                current: List[str] = []
+                for word in words:
+                    tentative = " ".join(current + [word])
+                    size, _ = cv2.getTextSize(tentative, font, font_scale, thickness)
+                    if size[0] <= max_width or not current:
+                        current.append(word)
+                        continue
+                    lines.append(" ".join(current))
+                    current = [word]
+                if current:
+                    lines.append(" ".join(current))
+                return lines
+
+            lines = []
+            for raw_line in str(text).splitlines():
+                lines.extend(_wrap(raw_line.strip()))
+
+            y = 24
+            for line in lines:
+                if not line:
+                    y += 18
+                    continue
+                cv2.putText(
+                    canvas,
+                    line,
+                    (10, y),
+                    font,
+                    font_scale,
+                    (255, 255, 255),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+                y += int(18 * font_scale) + 12
 
     return canvas
 
