@@ -27,6 +27,23 @@ except Exception:  # pragma: no cover - optional dependency
     VideoMAEConfig = None  # type: ignore[assignment]
 
 
+def _load_checkpoint_state_dict(checkpoint_path: Path) -> dict:
+    suffix = Path(checkpoint_path).suffix.lower()
+    if suffix == ".safetensors":
+        try:  # pragma: no cover - optional dependency
+            from safetensors.torch import load_file as safetensors_load_file
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "Loading .safetensors checkpoints requires the safetensors package"
+            ) from exc
+        state_dict = safetensors_load_file(str(checkpoint_path), device="cpu")
+    else:
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    return state_dict
+
+
 class ViTBackbone(nn.Module):
     """Wrapper around a ViT image encoder from ``timm``.
 
@@ -65,9 +82,7 @@ class ViTBackbone(nn.Module):
             self.model, "embed_dim", 768
         )
         if checkpoint_path is not None:
-            state_dict = torch.load(checkpoint_path, map_location="cpu")
-            if isinstance(state_dict, dict) and "state_dict" in state_dict:
-                state_dict = state_dict["state_dict"]
+            state_dict = _load_checkpoint_state_dict(checkpoint_path)
             self.model.load_state_dict(state_dict, strict=False)
         if freeze:
             for param in self.model.parameters():
@@ -108,9 +123,7 @@ class VideoMAEBackbone(nn.Module):
             config = VideoMAEConfig.from_pretrained(model_name)
             self.model = VideoMAEModel(config)
         if checkpoint_path is not None:
-            state_dict = torch.load(checkpoint_path, map_location="cpu")
-            if isinstance(state_dict, dict) and "state_dict" in state_dict:
-                state_dict = state_dict["state_dict"]
+            state_dict = _load_checkpoint_state_dict(checkpoint_path)
             self.model.load_state_dict(state_dict, strict=False)
         if freeze:
             for param in self.model.parameters():
