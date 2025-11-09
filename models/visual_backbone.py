@@ -126,7 +126,7 @@ class VideoMAEBackbone(nn.Module):
         batch, time, channels, height, width = frames.shape
         if channels != 3:
             raise ValueError("VideoMAEBackbone expects RGB inputs with 3 channels")
-        pixel_values = frames.permute(0, 2, 1, 3, 4)
+        pixel_values = frames.contiguous()
         outputs = self.model(pixel_values=pixel_values, output_hidden_states=False)
         hidden = outputs.last_hidden_state  # (B, tokens, hidden)
         if getattr(self.model.config, "use_cls_token", True):
