@@ -58,7 +58,8 @@ import math
 import os
 import random
 import types
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -343,6 +344,48 @@ def jitter_keypoints(kp: torch.Tensor, noise_std: float = 0.04, drop_prob: float
         last = kp[:, -1:, :, :]
         kp = torch.where(keep, kp, last)
     return kp
+
+
+# -----------------------------
+# Serialization helpers
+# -----------------------------
+def _serialise_lora_config(lora_config: object) -> Dict[str, object]:
+    """Return a JSON/torch.save friendly representation of a LoRA config."""
+
+    cfg_dict = dict(lora_config.to_dict() if hasattr(lora_config, "to_dict") else {})
+    return _convert_to_primitives(cfg_dict)
+
+
+def _convert_to_primitives(value: object) -> object:
+    """Recursively convert values to ``torch.save`` friendly primitives."""
+
+    if isinstance(value, Enum):
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, str):
+            return enum_value
+        enum_name = getattr(value, "name", None)
+        if isinstance(enum_name, str):
+            return enum_name
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _convert_to_primitives(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        converted = [_convert_to_primitives(v) for v in value]
+        return type(value)(converted)
+    return value
+
+
+def _serialise_train_config(cfg: TrainConfig) -> Dict[str, object]:
+    """Convert :class:`TrainConfig` into primitives accepted by ``torch.save``."""
+
+    raw = asdict(cfg)
+    serialised: Dict[str, object] = {}
+    for key, value in raw.items():
+        if isinstance(value, Path):
+            serialised[key] = str(value)
+        else:
+            serialised[key] = _convert_to_primitives(value)
+    return serialised
 
 
 # -----------------------------
@@ -672,8 +715,8 @@ def train(cfg: TrainConfig) -> None:
                     "adapter": adapter.state_dict(),
                     "bridge": bridge.state_dict(),
                     "lora": get_peft_model_state_dict(decoder),
-                    "lora_config": lora_config.to_dict(),
-                    "config": cfg.__dict__,
+                    "lora_config": _serialise_lora_config(lora_config),
+                    "config": _serialise_train_config(cfg),
                     "d_model": d_model,
                     "num_landmarks": N,
                 }
@@ -699,8 +742,8 @@ def train(cfg: TrainConfig) -> None:
         "adapter": adapter.state_dict(),
         "bridge": bridge.state_dict(),
         "lora": get_peft_model_state_dict(decoder),
-        "lora_config": lora_config.to_dict(),
-        "config": cfg.__dict__,
+        "lora_config": _serialise_lora_config(lora_config),
+        "config": _serialise_train_config(cfg),
         "d_model": d_model,
         "num_landmarks": N,
     }
