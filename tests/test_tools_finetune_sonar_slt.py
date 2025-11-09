@@ -116,6 +116,31 @@ def synthetic_training_setup(tmp_path: Path, hf_sonar_dir: Path, monkeypatch: py
     return config
 
 
+def test_kptextdataset_reshapes_flattened_keypoints(tmp_path: Path):
+    keypoints_dir = tmp_path / "kp"
+    keypoints_dir.mkdir()
+    csv_path = tmp_path / "meta.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["id", "text"], delimiter=";")
+        writer.writeheader()
+        writer.writerow({"id": "clip01", "text": "hello"})
+
+    num_landmarks = 7
+    frames = 3
+    flat = np.arange(frames * num_landmarks * 4, dtype=np.float32).reshape(frames, -1)
+    np.save(keypoints_dir / "clip01.npy", flat)
+
+    dataset = finetune.KPTextDataset(keypoints_dir, csv_path, T=frames, shuffle=False)
+    sample = dataset[0]
+
+    keypoints = sample["keypoints"]
+    assert isinstance(keypoints, torch.Tensor)
+    assert keypoints.shape == (frames, num_landmarks, finetune.KEYPOINT_CHANNELS)
+    # Confidence channel should match the original last channel after reshaping.
+    original_conf = flat.reshape(frames, num_landmarks, 4)[..., -1]
+    assert torch.allclose(keypoints[..., 2], torch.from_numpy(original_conf), atol=1e-6)
+
+
 def test_train_pipeline_generates_checkpoint(synthetic_training_setup: finetune.TrainConfig):
     config = synthetic_training_setup
     finetune.train(config)
