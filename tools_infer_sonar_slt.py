@@ -575,18 +575,29 @@ def resolve_clips(rows: List[Dict[str, str]], keypoints_dir: Optional[Path]) -> 
         raise FileNotFoundError("--keypoints-dir must point to existing .npz/.npy files")
     out: List[Clip] = []
     for row in rows:
-        clip_id = row.get("id") or row.get("video_id") or row.get("video")
-        if not clip_id:
+        clip_id_raw = row.get("id") or row.get("video_id") or row.get("video")
+        if not clip_id_raw:
             raise ValueError("meta.csv must contain an 'id' or 'video' column")
 
+        clip_id = clip_id_raw.strip() if isinstance(clip_id_raw, str) else str(clip_id_raw)
+        clip_path = Path(clip_id)
+        base_path = keypoints_dir / clip_path
+
         kp_path = None
+        candidates = [base_path]
         for ext in (".npz", ".npy"):
-            cand = keypoints_dir / f"{clip_id}{ext}"
+            cand = base_path.with_suffix(ext)
+            if cand not in candidates:
+                candidates.append(cand)
+
+        for cand in candidates:
             if cand.exists():
                 kp_path = cand
                 break
         if kp_path is None:
-            raise FileNotFoundError(f"Keypoints not found for id={clip_id} in {keypoints_dir}")
+            raise FileNotFoundError(
+                f"Keypoints not found for id={clip_id} in {keypoints_dir}"
+            )
 
         video_name = row.get("video") or row.get("file") or kp_path.stem
         out.append(Clip(clip_id=clip_id, keypoints_path=kp_path, video_name=video_name))

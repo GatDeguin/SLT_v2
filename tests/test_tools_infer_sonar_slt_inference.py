@@ -94,3 +94,17 @@ def test_inference_pipeline_runs(tmp_path: Path, sonar_checkpoint: Path, hf_sona
     with logs_path.open("r", encoding="utf-8") as fh:
         records = [json.loads(line) for line in fh if line.strip()]
     assert records
+
+
+def test_resolve_clips_supports_ids_with_extension(tmp_path: Path) -> None:
+    keypoints_dir = tmp_path / "kp"
+    keypoints_dir.mkdir()
+
+    keypoints = np.zeros((1, 3, infer.KEYPOINT_CHANNELS), dtype=np.float32)
+    np.save(keypoints_dir / "clip.npy", keypoints)
+
+    rows = [{"id": "clip.npy", "text": "placeholder"}]
+
+    clips = infer.resolve_clips(rows, keypoints_dir)
+    assert len(clips) == 1
+    assert clips[0].keypoints_path == keypoints_dir / "clip.npy"
