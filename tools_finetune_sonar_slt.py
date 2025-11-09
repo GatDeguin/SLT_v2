@@ -387,23 +387,48 @@ class TrainConfig:
     freeze_videomae: bool = False
 
 
+def _cuda_is_available() -> bool:
+    """Return True if torch.cuda is available, guarding against CPU-only builds."""
+
+    try:  # torch.cuda.is_available may raise when CUDA support is missing entirely
+        return bool(torch.cuda.is_available())
+    except (AssertionError, RuntimeError):
+        return False
+
+
 def resolve_device(name: str) -> torch.device:
     raw_name = name.strip()
     lowered = raw_name.lower()
+    cuda_available = _cuda_is_available()
+    mps_available = torch.backends.mps.is_available()
+
     if lowered == "auto":
-        if torch.cuda.is_available():
+        if cuda_available:
             return torch.device("cuda")
-        if torch.backends.mps.is_available():
+        if mps_available:
             return torch.device("mps")
         return torch.device("cpu")
+
     try:
-        return torch.device(raw_name)
+        device = torch.device(raw_name)
+        if device.type == "cuda" and not cuda_available:
+            print("[device] Requested CUDA but PyTorch lacks CUDA support — using CPU instead.")
+            return torch.device("cpu")
+        if device.type == "mps" and not mps_available:
+            print("[device] Requested MPS but backend is unavailable — using CPU instead.")
+            return torch.device("cpu")
+        return device
     except (TypeError, RuntimeError, ValueError, AttributeError):
         pass
-    if lowered in {"cuda", "gpu"} and torch.cuda.is_available():
-        return torch.device("cuda")
-    if lowered == "mps" and torch.backends.mps.is_available():
-        return torch.device("mps")
+
+    if lowered in {"cuda", "gpu"}:
+        if cuda_available:
+            return torch.device("cuda")
+        print("[device] CUDA requested but unavailable — using CPU instead.")
+    elif lowered == "mps":
+        if mps_available:
+            return torch.device("mps")
+        print("[device] MPS requested but unavailable — using CPU instead.")
     return torch.device("cpu")
 
 
