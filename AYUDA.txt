@@ -31,7 +31,17 @@ python visualize_keypoints_viewer.py    --videos-dir single_signer/videos  --key
 ENTRENAMIENTO:
 --------------
 
-python tools_finetune_sonar_slt.py   --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out runs\sonar_slt_finetune_lsa   --model-name mtmlt/sonar-nllb-200-1.3B   --tgt-lang spa_Latn   --epochs 1000 --batch-size 8 --accum 2 --lr 3e-4 --T 128 --half --device cuda --save-every 10 --log-every 1 --lam-nce 0.05 --nce-temperature 0.07
+python tools_finetune_sonar_slt.py `
+  --keypoints-dir single_signer\kp\keypoints `
+  --csv meta.csv `
+  --out runs\sonar_slt_finetune_lsa_v2 `
+  --model-name mtmlt/sonar-nllb-200-1.3B `
+  --tgt-lang spa_Latn `
+  --epochs 50 --batch-size 8 --accum 2 --lr 3e-4 --T 128 `
+  --half --device cuda --save-every 100 --log-every 1 `
+  --lam-sem 0.5 --mse-weight 2500 --cos-weight 2.0 `
+  --lam-ce 1.0 --lam-ae 0.5 --lam-nce 0.05 --nce-temperature 0.07
+
 
 
 
