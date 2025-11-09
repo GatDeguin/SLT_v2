@@ -174,6 +174,60 @@ TEXT_ALIASES = ("texto", "text", "sentence", "transcript")
 # -----------------------------
 # Keypoint utilities (normalise + sample) — mirrors repo inference helpers
 # -----------------------------
+def reshape_flat_keypoints(
+    kp: np.ndarray, num_landmarks: int = 0, *, expected_channels: int = KEYPOINT_CHANNELS
+) -> np.ndarray:
+    """Mirror inference reshape heuristic for flattened MediaPipe dumps."""
+
+    if kp.ndim != 2:
+        return kp
+
+    feat_dim = kp.shape[1]
+
+    candidate_points: Optional[int] = None
+    if num_landmarks > 0 and feat_dim % num_landmarks == 0:
+        candidate_points = num_landmarks
+    elif feat_dim % 543 == 0:
+        candidate_points = 543
+    elif feat_dim % expected_channels == 0:
+        candidate_points = feat_dim // expected_channels
+    else:
+        for channels in range(expected_channels + 1, expected_channels + 4):
+            if channels <= 0:
+                continue
+            if feat_dim % channels == 0:
+                candidate_points = feat_dim // channels
+                break
+
+    if candidate_points is None or candidate_points <= 0:
+        raise ValueError(
+            "Cannot infer landmark count from flattened keypoints with feature "
+            f"dimension {feat_dim}"
+        )
+
+    inferred_channels = feat_dim // candidate_points
+    if candidate_points * inferred_channels != feat_dim:
+        raise ValueError(
+            "Flattened keypoints feature dimension does not evenly divide into "
+            f"{candidate_points} landmarks and {inferred_channels} channels"
+        )
+    if inferred_channels < expected_channels:
+        raise ValueError(
+            f"Expected at least {expected_channels} channels but found {inferred_channels}"
+        )
+
+    reshaped = kp.reshape(-1, candidate_points, inferred_channels)
+    if inferred_channels > expected_channels:
+        if expected_channels == 3 and inferred_channels >= 3:
+            coords = reshaped[..., :2]
+            confidence = reshaped[..., -1:]
+            reshaped = np.concatenate([coords, confidence], axis=-1)
+        else:
+            reshaped = reshaped[..., :expected_channels]
+
+    return reshaped
+
+
 def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     """Center by mean landmark and scale to unit max‑radius; keep confidence.
     Expects (T, N, C≥2). Returns same shape (T, N, 3).
@@ -291,10 +345,9 @@ class KPTextDataset(Dataset):
         if kp_path is None:
             raise FileNotFoundError(f"Keypoints not found for id={row.vid} in {self.keypoints_dir}")
         keypoints = self._load_np(kp_path)
-        if keypoints.ndim == 2:
-            # reshape (T, N*C) → (T, N, C)
-            N = 543 if keypoints.shape[1] % 543 == 0 else keypoints.shape[1] // KEYPOINT_CHANNELS
-            keypoints = keypoints.reshape(-1, N, KEYPOINT_CHANNELS)
+        keypoints = reshape_flat_keypoints(
+            keypoints, num_landmarks=0, expected_channels=KEYPOINT_CHANNELS
+        )
         keypoints = normalise_keypoints(keypoints)
         keypoints = pad_or_sample(keypoints, self.T, axis=0)
         video_tensor: Optional[torch.Tensor] = None
