@@ -78,6 +78,62 @@ if not logging.getLogger().hasHandlers():
 KEYPOINT_CHANNELS = 3  # (x, y, conf)
 
 
+def reshape_flat_keypoints(
+    kp: np.ndarray, num_landmarks: int, *, expected_channels: int = KEYPOINT_CHANNELS
+) -> np.ndarray:
+    """Convert flattened (T, F) MediaPipe dumps into (T, N, C) arrays.
+
+    The heuristic mirrors the training pipeline: prefer the checkpoint's declared
+    ``num_landmarks`` when the feature dimension is a multiple of that count, fall
+    back to 543 (MediaPipe Holistic default), and as a last resort derive the
+    landmark count from the expected channel size.
+
+    When more than ``expected_channels`` are present per landmark (e.g., x/y/z/conf),
+    the surplus channels are dropped after reshaping so that downstream code always
+    observes (x, y, conf).
+    """
+
+    if kp.ndim != 2:
+        return kp
+
+    feat_dim = kp.shape[1]
+
+    candidate_points = None
+    if num_landmarks > 0 and feat_dim % num_landmarks == 0:
+        candidate_points = num_landmarks
+    elif feat_dim % 543 == 0:
+        candidate_points = 543
+    elif feat_dim % expected_channels == 0:
+        candidate_points = feat_dim // expected_channels
+
+    if candidate_points is None or candidate_points <= 0:
+        raise ValueError(
+            "Cannot infer landmark count from flattened keypoints with feature "
+            f"dimension {feat_dim}"
+        )
+
+    inferred_channels = feat_dim // candidate_points
+    if candidate_points * inferred_channels != feat_dim:
+        raise ValueError(
+            "Flattened keypoints feature dimension does not evenly divide into "
+            f"{candidate_points} landmarks and {inferred_channels} channels"
+        )
+    if inferred_channels < expected_channels:
+        raise ValueError(
+            f"Expected at least {expected_channels} channels but found {inferred_channels}"
+        )
+
+    reshaped = kp.reshape(-1, candidate_points, inferred_channels)
+    if inferred_channels > expected_channels:
+        LOGGER.debug(
+            "Dropping %d surplus keypoint channel(s) (keeping first %d)",
+            inferred_channels - expected_channels,
+            expected_channels,
+        )
+        reshaped = reshaped[..., :expected_channels]
+    return reshaped
+
+
 def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     """Center by mean landmark and scale to unit max-radius; keep confidence.
     Expects (T, N, C≥2). Returns same shape (T, N, 3).
@@ -590,7 +646,16 @@ def load_keypoints_array(path: Path) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser(description="SONAR‑SLT inference: keypoints → semantic decoding")
-    ap.add_argument("--keypoints-dir", type=Path, required=True)
+    ap.add_argument(
+        "--keypoints-dir",
+        type=Path,
+        required=True,
+        help=(
+            "Directory with MediaPipe keypoint arrays (.npy/.npz). Flattened dumps "
+            "((T, N*C)) are reshaped automatically and extra channels beyond x/y/conf "
+            "are dropped."
+        ),
+    )
     ap.add_argument(
         "--adapter-ckpt",
         type=Path,
@@ -710,16 +775,7 @@ def main():
                 raise FileNotFoundError(f"Missing keypoints for {clip.clip_id}: {clip.keypoints_path}")
             kp = load_keypoints_array(clip.keypoints_path)
             if kp.ndim == 2:
-                feat_dim = kp.shape[1]
-                if feat_dim % KEYPOINT_CHANNELS == 0:
-                    num_points = feat_dim // KEYPOINT_CHANNELS
-                elif feat_dim % 543 == 0:
-                    num_points = 543
-                else:
-                    raise ValueError(
-                        f"Cannot infer landmark count from shape {kp.shape} (expected multiple of {KEYPOINT_CHANNELS})"
-                    )
-                kp = kp.reshape(-1, num_points, KEYPOINT_CHANNELS)
+                kp = reshape_flat_keypoints(kp, num_landmarks)
             if kp.ndim != 3:
                 raise ValueError(f"Keypoints must be (T,N,C), got {kp.shape}")
             if kp.shape[1] != num_landmarks:
