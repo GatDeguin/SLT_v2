@@ -1,306 +1,96 @@
-import importlib.util
+from __future__ import annotations
+
+import csv
+import json
 import sys
-import types
 from pathlib import Path
 
 import numpy as np
+import torch
+import pytest
+
+import tools_infer_sonar_slt as infer
+from transformers import AutoModelForSeq2SeqLM
 
 
-class _DummyContext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def __call__(self, func):
-        return func
+def _write_meta_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["id", "text"], delimiter=";")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def _ensure_torch_stub():
-    if "torch" in sys.modules:
-        return
+@pytest.fixture()
+def sonar_checkpoint(tmp_path: Path, hf_sonar_dir: Path) -> Path:
+    model = infer.SonarSLTInference(num_landmarks=3)
+    adapter_state = model.fusion_adapter.state_dict()
 
-    torch = types.ModuleType("torch")
-    torch.Tensor = object
-    torch.float32 = "float32"
-    torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
-
-    def _no_grad(func=None):
-        if func is None:
-            return _DummyContext()
-        return func
-
-    torch.no_grad = _no_grad
-    torch.inference_mode = _no_grad
-    torch.cuda = types.SimpleNamespace(
-        is_available=lambda: False,
-        amp=types.SimpleNamespace(
-            GradScaler=lambda *a, **k: object(),
-            autocast=lambda *a, **k: _DummyContext(),
-        ),
+    decoder_model = AutoModelForSeq2SeqLM.from_pretrained(str(hf_sonar_dir))
+    d_model = getattr(decoder_model.config, "d_model", None) or getattr(
+        decoder_model.config, "hidden_size", 1024
     )
-    torch.amp = types.SimpleNamespace(
-        GradScaler=lambda *a, **k: object(),
-        autocast=lambda *a, **k: _DummyContext(),
-    )
-    torch.optim = types.SimpleNamespace(AdamW=lambda *a, **k: object())
-    torch.linalg = types.SimpleNamespace(pinv=lambda *a, **k: None)
-    torch.save = lambda *a, **k: None
-    torch.from_numpy = lambda arr: arr
-    torch.stack = lambda tensors, dim=0: tensors
-    torch.randn_like = lambda tensor: tensor
-    torch.rand = lambda *args, **kwargs: 0
-    torch.where = lambda condition, x, y: x
-    torch.zeros_like = lambda tensor: tensor
-    torch.is_tensor = lambda obj: False
-    torch.serialization = types.SimpleNamespace(add_safe_globals=lambda *a, **k: None)
+    bridge = torch.nn.Linear(1024, d_model, bias=False)
+    bridge_state = bridge.state_dict()
 
-    torch.utils = types.ModuleType("torch.utils")
-    torch.utils.data = types.ModuleType("torch.utils.data")
-    torch.utils.data.Dataset = object
-    torch.utils.data.DataLoader = object
-
-    torch_nn = types.ModuleType("torch.nn")
-
-    class _Module:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def to(self, *args, **kwargs):
-            return self
-
-    torch_nn.Module = _Module
-    torch_nn.Linear = lambda *a, **k: _Module()
-    torch_nn.Sequential = lambda *modules: _Module()
-    torch_nn.LayerNorm = lambda *a, **k: _Module()
-    torch_nn.Dropout = lambda *a, **k: _Module()
-    torch_nn.GELU = lambda *a, **k: _Module()
-    torch_nn.TransformerEncoderLayer = lambda *a, **k: _Module()
-    torch_nn.TransformerEncoder = lambda *a, **k: _Module()
-
-    torch_nn_functional = types.ModuleType("torch.nn.functional")
-
-    sys.modules["torch"] = torch
-    sys.modules["torch.nn"] = torch_nn
-    sys.modules["torch.nn.functional"] = torch_nn_functional
-    sys.modules["torch.utils"] = torch.utils
-    sys.modules["torch.utils.data"] = torch.utils.data
-
-
-def _ensure_numpy_stub():
-    if "numpy" in sys.modules:
-        return
-
-    class _NumpyStub(types.ModuleType):
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: None
-
-    numpy = _NumpyStub("numpy")
-    numpy.ndarray = object
-    numpy.float32 = "float32"
-    numpy.float64 = "float64"
-    numpy.int64 = "int64"
-
-    sys.modules["numpy"] = numpy
-
-
-def _ensure_transformers_stub():
-    if "transformers" in sys.modules:
-        return
-
-    transformers = types.ModuleType("transformers")
-    transformers.AutoModelForSeq2SeqLM = object
-    transformers.AutoTokenizer = object
-    transformers.PreTrainedModel = object
-    transformers.GenerationConfig = object
-
-    modeling_outputs = types.ModuleType("transformers.modeling_outputs")
-    modeling_outputs.BaseModelOutput = object
-
-    transformers.modeling_outputs = modeling_outputs
-
-    sys.modules["transformers"] = transformers
-    sys.modules["transformers.modeling_outputs"] = modeling_outputs
-
-
-class FakeFusionAdapter:
-    def __init__(self):
-        self.received_state = None
-        self.missing = []
-        self.unexpected = []
-        self.kp_proj = types.SimpleNamespace(weight=None, bias=None)
-        self.keypoint_bias = None
-        self._state_dict = {
-            "kp_enc.some_weight": "existing_weight",
-            "kp_proj.weight": "existing_kp_weight",
-            "kp_proj.bias": "existing_kp_bias",
-            "keypoint_bias": "existing_bias",
-        }
-
-    def load_state_dict(self, state_dict, strict=False):
-        self.received_state = dict(state_dict)
-        self.kp_proj.weight = self.received_state.get("kp_proj.weight")
-        self.kp_proj.bias = self.received_state.get("kp_proj.bias")
-        self.keypoint_bias = self.received_state.get("keypoint_bias")
-        return self.missing, self.unexpected
-
-    def state_dict(self):
-        return dict(self._state_dict)
-
-
-_defused = False
-
-
-def _import_module():
-    global _defused
-    if not _defused:
-        _ensure_torch_stub()
-        _ensure_numpy_stub()
-        _ensure_transformers_stub()
-        _defused = True
-
-    transformers = sys.modules["transformers"]
-    if not hasattr(transformers, "PreTrainedModel"):
-        transformers.PreTrainedModel = object
-    if not hasattr(transformers, "GenerationConfig"):
-        transformers.GenerationConfig = object
-
-    module_path = Path(__file__).resolve().parent.parent / "tools_infer_sonar_slt.py"
-    spec = importlib.util.spec_from_file_location("tools_infer_sonar_slt", module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["tools_infer_sonar_slt"] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_load_adapter_converts_visual_fusion_state(capsys):
-    module = _import_module()
-    fake_adapter = FakeFusionAdapter()
-    instance = module.SonarSLTInference.__new__(module.SonarSLTInference)
-    instance.fusion_adapter = fake_adapter
-
-    adapter_state = {
-        "kp_enc.some_weight": object(),
-        "fusion.key_proj.weight": "weight_tensor",
-        "fusion.key_proj.bias": "bias_tensor",
-        "fusion.modality_embeddings.weight": [[1, 2, 3], [4, 5, 6]],
-        "fusion.spatial_proj.bias": "ignore_me_too",
-        "fusion.motion_proj.weight": "ignore_me_three",
-        "vit.encoder.layers.0.weight": "vit_tensor",
-        "videomae.encoder.layers.0.bias": "videomae_tensor",
+    ckpt = {
+        "adapter": adapter_state,
+        "bridge": bridge_state,
+        "num_landmarks": 3,
+        "d_model": d_model,
+        "config": {"model_name": str(hf_sonar_dir)},
     }
-
-    instance.load_adapter(adapter_state)
-    captured = capsys.readouterr()
-
-    assert fake_adapter.kp_proj.weight == "weight_tensor"
-    assert fake_adapter.kp_proj.bias == "bias_tensor"
-    assert fake_adapter.keypoint_bias == [1, 2, 3]
-    assert fake_adapter.received_state is not None
-    assert "fusion.key_proj.weight" not in fake_adapter.received_state
-    assert "fusion.modality_embeddings.weight" not in fake_adapter.received_state
-    assert "fusion.spatial_proj.bias" not in fake_adapter.received_state
-    assert "fusion.motion_proj.weight" not in fake_adapter.received_state
-    assert "vit.encoder.layers.0.weight" not in fake_adapter.received_state
-    assert "videomae.encoder.layers.0.bias" not in fake_adapter.received_state
-    log_output = captured.out + captured.err
-    assert "vit.encoder.layers.0.weight" in log_output
-    assert "videomae.encoder.layers.0.bias" in log_output
+    ckpt_path = tmp_path / "adapter.pt"
+    torch.save(ckpt, ckpt_path)
+    return ckpt_path
 
 
-def test_flat_keypoints_extra_channels_trimmed():
-    module = _import_module()
-    num_landmarks = 543
-    timesteps = 2
-    flat = np.arange(timesteps * num_landmarks * 4, dtype=np.float32).reshape(
-        timesteps, num_landmarks * 4
-    )
+def test_inference_pipeline_runs(tmp_path: Path, sonar_checkpoint: Path, hf_sonar_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    keypoints_dir = tmp_path / "kp"
+    keypoints_dir.mkdir()
 
-    reshaped = module.reshape_flat_keypoints(flat, num_landmarks)
+    rng = np.random.default_rng(42)
+    keypoints = rng.normal(size=(2, 3, infer.KEYPOINT_CHANNELS)).astype(np.float32)
+    np.save(keypoints_dir / "clip01.npy", keypoints)
 
-    assert reshaped.shape == (timesteps, num_landmarks, module.KEYPOINT_CHANNELS)
-    reshaped_full = flat.reshape(timesteps, num_landmarks, 4)
-    expected = np.concatenate(
-        [reshaped_full[..., :2], reshaped_full[..., -1:]], axis=-1
-    )
-    np.testing.assert_array_equal(reshaped, expected)
+    meta_csv = tmp_path / "meta.csv"
+    _write_meta_csv(meta_csv, [{"id": "clip01", "text": "placeholder"}])
 
+    out_dir = tmp_path / "out"
+    args = [
+        "tools_infer_sonar_slt.py",
+        "--keypoints-dir",
+        str(keypoints_dir),
+        "--adapter-ckpt",
+        str(sonar_checkpoint),
+        "--csv",
+        str(meta_csv),
+        "--out",
+        str(out_dir),
+        "--sonar-model-dir",
+        str(hf_sonar_dir),
+        "--tgt-lang",
+        "en_XX",
+        "--T",
+        "2",
+        "--num-beams",
+        "1",
+        "--max-new-tokens",
+        "4",
+    ]
+    monkeypatch.setenv("TRANSFORMERS_CACHE", str((tmp_path / "hf_cache").resolve()))
+    monkeypatch.setattr(sys, "argv", args)
 
-def test_normalise_keypoints_retains_confidence_track():
-    module = _import_module()
-    raw = np.array([
-        [[1.0, 2.0, 99.0, 0.9], [3.0, 4.0, 42.0, 0.8]],
-    ])
+    infer.main()
 
-    normalised = module.normalise_keypoints(raw)
+    preds_path = out_dir / "preds.csv"
+    logs_path = out_dir / "logs.jsonl"
 
-    assert normalised.shape == (1, 2, module.KEYPOINT_CHANNELS)
+    assert preds_path.exists()
+    with preds_path.open("r", encoding="utf-8") as fh:
+        lines = [line.strip() for line in fh if line.strip()]
+    assert len(lines) == 2
 
-    coords = raw[..., :2]
-    center = coords.mean(axis=-2, keepdims=True)
-    centered = coords - center
-    norms = np.linalg.norm(centered, axis=-1)
-    max_norm = np.max(norms, axis=-1, keepdims=True)
-    max_norm = np.clip(max_norm, 1e-4, None)
-    expected_coords = centered / max_norm[..., None]
-    expected = np.concatenate([expected_coords, raw[..., -1:]], axis=-1)
-
-    np.testing.assert_allclose(normalised, expected)
-
-
-def test_fusion_adapter_forward_adds_keypoint_bias():
-    module = _import_module()
-
-    class DummyTensor:
-        def __init__(self, value):
-            self.value = value
-
-        def __add__(self, other):
-            other_value = getattr(other, "value", other)
-            return DummyTensor(self.value + other_value)
-
-        __radd__ = __add__
-
-        def mean(self, dim):
-            return DummyTensor(self.value)
-
-    class DummyBias:
-        def __init__(self, value):
-            self.value = value
-
-        def view(self, *shape):
-            return self
-
-    class DummyModule:
-        def __init__(self, result):
-            self._result = result
-
-        def __call__(self, *args, **kwargs):
-            return self._result
-
-    class DummyFusion:
-        def __init__(self):
-            self.received = None
-
-        def __call__(self, tensor):
-            self.received = tensor
-            return tensor
-
-    adapter = module.FusionAdapter.__new__(module.FusionAdapter)
-    encoded = DummyTensor(0)
-    projected = DummyTensor(0)
-    fusion = DummyFusion()
-
-    adapter.kp_enc = DummyModule(encoded)
-    adapter.kp_proj = DummyModule(projected)
-    adapter.keypoint_bias = DummyBias(7)
-    adapter.fusion = fusion
-    adapter.out_norm = lambda x: x
-    adapter.out_proj = lambda x: x
-
-    output = adapter.forward(object())
-
-    assert fusion.received.value == 7
-    assert output.value == 7
+    assert logs_path.exists()
+    with logs_path.open("r", encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+    assert records

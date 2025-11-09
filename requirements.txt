@@ -1,0 +1,17 @@
+# Core tensor libraries
+numpy>=1.24
+torch>=2.1
+
+# Hugging Face ecosystem for text/vision models
+transformers[video]>=4.42.0
+peft>=0.10.0
+sentencepiece>=0.1.99
+
+# Visual processing dependencies
+opencv-python>=4.9.0
+mediapipe>=0.10.0
+Pillow>=10.0.0
+timm>=0.9.16
+
+# Evaluation utilities
+sacrebleu>=2.4.0
