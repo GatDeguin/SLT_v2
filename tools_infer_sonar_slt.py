@@ -39,6 +39,7 @@ import csv
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path, WindowsPath
 from typing import Any, Dict, List, Optional
@@ -74,6 +75,13 @@ except Exception:  # pragma: no cover - best effort import when PEFT is unavaila
 LOGGER = logging.getLogger("tools_infer_sonar_slt")
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(level=logging.INFO)
+else:
+    LOGGER.setLevel(logging.INFO)
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler(stream=sys.stdout)
+        handler.setLevel(logging.INFO)
+        LOGGER.addHandler(handler)
+    LOGGER.propagate = False
 
 KEYPOINT_CHANNELS = 3  # (x, y, conf)
 
@@ -126,11 +134,15 @@ def reshape_flat_keypoints(
     reshaped = kp.reshape(-1, candidate_points, inferred_channels)
     if inferred_channels > expected_channels:
         LOGGER.debug(
-            "Dropping %d surplus keypoint channel(s) (keeping first %d)",
+            "Dropping %d surplus keypoint channel(s) (keeping x/y and the last channel)",
             inferred_channels - expected_channels,
-            expected_channels,
         )
-        reshaped = reshaped[..., :expected_channels]
+        if expected_channels == 3 and inferred_channels >= 3:
+            coords = reshaped[..., :2]
+            confidence = reshaped[..., -1:]
+            reshaped = np.concatenate([coords, confidence], axis=-1)
+        else:
+            reshaped = reshaped[..., :expected_channels]
     return reshaped
 
 
@@ -139,7 +151,12 @@ def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     Expects (T, N, C≥2). Returns same shape (T, N, 3).
     """
     coords = arr[..., :2]
-    conf = arr[..., 2:3] if arr.shape[-1] >= 3 else np.ones_like(coords[..., :1])
+    if arr.shape[-1] > KEYPOINT_CHANNELS:
+        conf = arr[..., -1:]
+    elif arr.shape[-1] >= KEYPOINT_CHANNELS:
+        conf = arr[..., 2:3]
+    else:
+        conf = np.ones_like(coords[..., :1])
     center = coords.mean(axis=-2, keepdims=True)
     centered = coords - center
     norms = np.linalg.norm(centered, axis=-1)
