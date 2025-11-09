@@ -43,6 +43,21 @@ python tools_finetune_sonar_slt.py `
   --lam-ce 2.0 --lam-ae 0.2 --lam-nce 0.05 --nce-temperature 0.07 `
   --sample-metrics  --save-samples
 
+o
+
+
+
+python tools_finetune_sonar_slt.py `
+   --keypoints-dir single_signer\kp\keypoints `
+   --csv meta.csv `
+   --out runs\sonar_slt_finetune_lsa_v2 `
+   --model-name mtmlt/sonar-nllb-200-1.3B `
+   --tgt-lang spa_Latn `
+   --epochs 50 --batch-size 4 --accum 4 --lr 1e-4 --T 128 `
+   --device cuda --save-every 100 --log-every 1 `
+   --lam-sem 0.4 --mse-weight 1500 --cos-weight 1.5 `
+   --lam-ce 1.5 --lam-ae 0.5 --lam-nce 0.03 --nce-temperature 0.07 `
+   --sample-metrics  --save-samples
 
 
 
