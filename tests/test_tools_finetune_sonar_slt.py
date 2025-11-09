@@ -1,226 +1,151 @@
-import sys
-import types
-import importlib.util
+from __future__ import annotations
+
+import csv
+import json
 from pathlib import Path
+from typing import Iterable, Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import pytest
+
+import tools_finetune_sonar_slt as finetune
 
 
-class _DummyContext:
-    def __enter__(self):
-        return None
+class TinyVisualAdapter(nn.Module):
+    def __init__(self, config: object, num_points: int, **_: object) -> None:
+        super().__init__()
+        self.num_points = num_points
+        self.proj = nn.Linear(num_points * finetune.KEYPOINT_CHANNELS, 1024)
 
-    def __exit__(self, exc_type, exc, tb):
-        return False
+    def forward(
+        self,
+        keypoints: torch.Tensor,
+        frames: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if frames is not None:
+            raise AssertionError("TinyVisualAdapter expects keypoints only in tests")
+        b, t, n, c = keypoints.shape
+        x = keypoints.reshape(b, t, n * c).mean(dim=1)
+        return self.proj(x)
 
-    def __call__(self, func):
-        return func
+
+class SimpleTextPooler:
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer,
+        lang: str,
+        *,
+        num_layers: int,
+    ) -> None:
+        self._model = model
+        self._tokenizer = tokenizer
+        self._lang = lang
+        self._num_layers = num_layers
+
+    def encode(self, texts: Sequence[str]) -> torch.Tensor:
+        if not texts:
+            raise ValueError("encode expects at least one text")
+        device = next(self._model.parameters()).device
+        if hasattr(self._tokenizer, "src_lang"):
+            self._tokenizer.src_lang = self._lang
+        batch = self._tokenizer(texts, return_tensors="pt", padding=True).to(device)
+        encoder = self._model.get_encoder()
+        outputs = encoder(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            return_dict=True,
+        )
+        return outputs.last_hidden_state.mean(dim=1)
 
 
-def _ensure_torch_stub():
-    if "torch" in sys.modules:
-        return
+@pytest.fixture()
+def synthetic_training_setup(tmp_path: Path, hf_sonar_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    keypoints_dir = tmp_path / "kp"
+    keypoints_dir.mkdir()
+    meta_path = tmp_path / "meta.csv"
+    rows = [
+        {"id": "clip01", "text": "hello world"},
+        {"id": "clip02", "text": "hola mundo"},
+    ]
+    with meta_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["id", "text"], delimiter=";")
+        writer.writeheader()
+        writer.writerows(rows)
 
-    torch = types.ModuleType("torch")
-    torch.Tensor = object
-    torch.float32 = "float32"
-    torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
+    rng = np.random.default_rng(0)
+    for row in rows:
+        kp = rng.normal(size=(4, 5, finetune.KEYPOINT_CHANNELS)).astype(np.float32)
+        np.save(keypoints_dir / f"{row['id']}.npy", kp)
 
-    def _no_grad(func=None):
-        if func is None:
-            return _DummyContext()
-        return func
+    monkeypatch.setattr(finetune, "VisualFusionAdapter", TinyVisualAdapter)
+    monkeypatch.setattr(finetune, "TextPooler", SimpleTextPooler)
+    monkeypatch.setattr(finetune.torch.amp, "GradScaler", torch.cuda.amp.GradScaler, raising=False)
 
-    torch.no_grad = _no_grad
-    torch.cuda = types.SimpleNamespace(
-        is_available=lambda: False,
-        amp=types.SimpleNamespace(
-            GradScaler=lambda *a, **k: object(),
-            autocast=lambda *a, **k: _DummyContext(),
-        ),
-    )
-    torch.amp = types.SimpleNamespace(
-        GradScaler=lambda *a, **k: object(),
-        autocast=lambda *a, **k: _DummyContext(),
-    )
-    torch.optim = types.SimpleNamespace(AdamW=lambda *a, **k: object())
-    torch.linalg = types.SimpleNamespace(pinv=lambda *a, **k: None)
-    torch.save = lambda *a, **k: None
-
-    def _from_numpy(arr):
-        class _FakeTensor:
-            def __init__(self, array):
-                self.array = array
-
-            def to(self, *args, **kwargs):
-                return self
-
-        return _FakeTensor(arr)
-
-    torch.from_numpy = _from_numpy
-
-    class _Device:
-        def __init__(self, spec):
-            self._spec = spec
-            if ":" in spec:
-                type_part, idx = spec.split(":", 1)
-                self.type = type_part.lower()
-                try:
-                    self.index = int(idx)
-                except ValueError:
-                    self.index = idx
-            else:
-                self.type = spec.lower()
-                self.index = None
-
-        def __repr__(self):
-            return f"device(type='{self.type}', index={self.index})"
-
-        def __str__(self):
-            return self._spec
-
-        def __eq__(self, other):
-            if isinstance(other, _Device):
-                return self._spec == other._spec
-            if isinstance(other, str):
-                return self._spec == other
-            return False
-
-    torch.device = lambda spec: _Device(spec)
-
-    torch.stack = lambda tensors, dim=0: tensors
-    torch.randn_like = lambda tensor: tensor
-    torch.rand = lambda *args, **kwargs: 0
-    torch.where = lambda condition, x, y: x
-    torch.zeros_like = lambda tensor: tensor
-
-    torch.utils = types.ModuleType("torch.utils")
-    torch.utils.data = types.ModuleType("torch.utils.data")
-    torch.utils.data.Dataset = object
-    torch.utils.data.DataLoader = object
-
-    torch_nn = types.ModuleType("torch.nn")
-
-    class _Module:
+    class _NoOpAutocast:
         def __init__(self, *args, **kwargs):
             pass
 
-        def to(self, *args, **kwargs):
-            return self
+        def __enter__(self):
+            return None
 
-    torch_nn.Module = _Module
-    torch_nn.Linear = lambda *a, **k: _Module()
-    torch_nn.Sequential = lambda *modules: _Module()
-    torch_nn.LayerNorm = lambda *a, **k: _Module()
-    torch_nn.Dropout = lambda *a, **k: _Module()
-    torch_nn.GELU = lambda *a, **k: _Module()
-    torch_nn.TransformerEncoderLayer = lambda *a, **k: _Module()
-    torch_nn.TransformerEncoder = lambda *a, **k: _Module()
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
-    torch_nn_functional = types.ModuleType("torch.nn.functional")
+    monkeypatch.setattr(finetune.torch.amp, "autocast", _NoOpAutocast, raising=False)
 
-    sys.modules["torch"] = torch
-    sys.modules["torch.nn"] = torch_nn
-    sys.modules["torch.nn.functional"] = torch_nn_functional
-    sys.modules["torch.utils"] = torch.utils
-    sys.modules["torch.utils.data"] = torch.utils.data
-
-
-def _ensure_numpy_stub():
-    if "numpy" in sys.modules:
-        return
-
-    class _NumpyStub(types.ModuleType):
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: None
-
-    numpy = _NumpyStub("numpy")
-    numpy.ndarray = object
-    numpy.float32 = "float32"
-    numpy.float64 = "float64"
-    numpy.int64 = "int64"
-
-    sys.modules["numpy"] = numpy
-
-
-def _ensure_transformers_stub():
-    if "transformers" in sys.modules:
-        return
-
-    transformers = types.ModuleType("transformers")
-    transformers.AutoModelForSeq2SeqLM = object
-    transformers.AutoTokenizer = object
-
-    modeling_outputs = types.ModuleType("transformers.modeling_outputs")
-    modeling_outputs.BaseModelOutput = object
-
-    transformers.modeling_outputs = modeling_outputs
-
-    sys.modules["transformers"] = transformers
-    sys.modules["transformers.modeling_outputs"] = modeling_outputs
-
-
-def test_read_meta_csv_accepts_semicolon(tmp_path):
-    _ensure_torch_stub()
-    _ensure_numpy_stub()
-    _ensure_transformers_stub()
-
-    module_path = Path(__file__).resolve().parent.parent / "tools_finetune_sonar_slt.py"
-    spec = importlib.util.spec_from_file_location("tools_finetune_sonar_slt", module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["tools_finetune_sonar_slt"] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-    csv_path = tmp_path / "meta.csv"
-    csv_path.write_text("video_id;text\nexample_01;hola mundo\n", encoding="utf-8")
-
-    rows = module._read_meta_csv(csv_path)
-
-    assert len(rows) == 1
-    assert rows[0].vid == "example_01"
-    assert rows[0].text == "hola mundo"
-
-
-def test_read_meta_csv_prefers_semicolon_header(tmp_path):
-    _ensure_torch_stub()
-    _ensure_numpy_stub()
-    _ensure_transformers_stub()
-
-    module_path = Path(__file__).resolve().parent.parent / "tools_finetune_sonar_slt.py"
-    spec = importlib.util.spec_from_file_location("tools_finetune_sonar_slt", module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["tools_finetune_sonar_slt"] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-    csv_path = tmp_path / "meta.csv"
-    csv_path.write_text(
-        "id;text;video\n"
-        "clip_001;estamos en noviembre, y reflexionaba.;noticias-en-lengua-de-senas-argentina-resumen-semanal-29112020\n",
-        encoding="utf-8",
+    out_dir = tmp_path / "run"
+    config = finetune.TrainConfig(
+        keypoints_dir=keypoints_dir,
+        csv=meta_path,
+        out_dir=out_dir,
+        model_name=str(hf_sonar_dir),
+        tgt_lang="en_XX",
+        T=4,
+        clip_frames=2,
+        batch_size=1,
+        accum=1,
+        epochs=1,
+        lr=5e-4,
+        save_every=1,
+        log_every=1,
+        lam_nce=0.0,
     )
-
-    rows = module._read_meta_csv(csv_path)
-
-    assert len(rows) == 1
-    assert rows[0].vid == "clip_001"
-    assert rows[0].text == "estamos en noviembre, y reflexionaba."
+    return config
 
 
-def test_resolve_device_accepts_indexed_cuda():
-    _ensure_torch_stub()
-    _ensure_numpy_stub()
-    _ensure_transformers_stub()
+def test_train_pipeline_generates_checkpoint(synthetic_training_setup: finetune.TrainConfig):
+    config = synthetic_training_setup
+    finetune.train(config)
 
-    module_path = Path(__file__).resolve().parent.parent / "tools_finetune_sonar_slt.py"
-    spec = importlib.util.spec_from_file_location("tools_finetune_sonar_slt", module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["tools_finetune_sonar_slt"] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    checkpoints_dir = config.out_dir / "checkpoints"
+    final_ckpt = checkpoints_dir / "adapter_final.pt"
+    assert final_ckpt.exists(), "training should produce a final adapter checkpoint"
 
-    module.torch.cuda.is_available = lambda: True
+    ckpt = torch.load(final_ckpt, map_location="cpu")
+    assert ckpt["num_landmarks"] == 5
+    assert "adapter" in ckpt and "bridge" in ckpt
+    bridge_weight = ckpt["bridge"]["weight"]
+    assert bridge_weight.shape[1] == 1024
+    assert ckpt["d_model"] == bridge_weight.shape[0]
 
-    device = module.resolve_device("cuda:1")
+    log_path = config.out_dir / "train_log.jsonl"
+    with log_path.open("r", encoding="utf-8") as fh:
+        entries = [json.loads(line) for line in fh if line.strip()]
+    assert entries, "training log should record at least one step"
 
-    assert device.type == "cuda"
-    assert device.index == 1
+
+@pytest.mark.parametrize(
+    "length,target",
+    [
+        (np.arange(5), 3),
+        (np.arange(2), 4),
+    ],
+)
+def test_pad_or_sample_behaviour(length: Iterable[int], target: int):
+    arr = np.asarray(list(length), dtype=np.float32)
+    arr = arr[:, None]
+    adjusted = finetune.pad_or_sample(arr, target, axis=0)
+    assert adjusted.shape[0] == target
