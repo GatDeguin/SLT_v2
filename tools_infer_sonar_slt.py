@@ -11,6 +11,7 @@ Usage (Windows PowerShell example):
     --adapter-ckpt runs/sonar_slt_finetune_lsa/checkpoints/adapter_final.pt \
     --out runs/sonar_slt_infer \
     --tgt-lang spa_Latn \
+    --model-name mtmlt/sonar-nllb-200-1.3B \
     --device auto
 
 Notes
@@ -19,7 +20,7 @@ Notes
 - Provide the checkpoint containing `adapter` and `bridge` weights from the fine‑tuning script.
 - Uses the SONAR HF port `mtmlt/sonar-nllb-200-1.3B` by default (matching training).
 - Bridge checkpoints remain compatible; `load_bridge` infers the correct shape from saved weights.
-- Override the decoder with `--sonar-model-dir /path/or/repo` if you have a local copy.
+- Override the decoder with `--model-name` (alias: `--sonar-model-dir`) if you have a local copy.
 - Designed to run on CPU or CUDA; use --half on capable GPUs.
 
 Dependencies
@@ -710,7 +711,19 @@ def main():
         "--sonar-model-dir",
         type=str,
         default=None,
-        help="Path or HF repo for SONAR decoder override (default: 'mtmlt/sonar-nllb-200-1.3B')",
+        help=(
+            "Path or HF repo for SONAR decoder override (default: 'mtmlt/sonar-nllb-200-1.3B'). "
+            "Deprecated in favour of --model-name to match the training CLI."
+        ),
+    )
+    ap.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help=(
+            "Alias for --sonar-model-dir kept for parity with tools_finetune_sonar_slt.py. "
+            "If both are provided they must match."
+        ),
     )
     ap.add_argument(
         "--adapter-device",
@@ -793,8 +806,15 @@ def main():
     model.eval()
 
     # SONAR decoder with bridge from checkpoint
+    if args.model_name and args.sonar_model_dir and args.model_name.strip() != args.sonar_model_dir.strip():
+        raise ValueError(
+            "--model-name and --sonar-model-dir refer to different models; "
+            "provide only one of them or use matching values."
+        )
+    model_name = args.model_name or args.sonar_model_dir
+
     decoder = SonarDecoder(
-        args.sonar_model_dir,
+        model_name,
         device=device,
         half=args.half,
         d_model=d_model,
