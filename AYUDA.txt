@@ -37,10 +37,10 @@ python tools_finetune_sonar_slt.py `
   --out runs\sonar_slt_finetune_lsa_v2 `
   --model-name mtmlt/sonar-nllb-200-1.3B `
   --tgt-lang spa_Latn `
-  --epochs 50 --batch-size 8 --accum 2 --lr 3e-4 --T 128 `
-  --half --device cuda --save-every 100 --log-every 1 `
-  --lam-sem 0.5 --mse-weight 2500 --cos-weight 2.0 `
-  --lam-ce 1.0 --lam-ae 0.5 --lam-nce 0.05 --nce-temperature 0.07
+  --epochs 50 --batch-size 8 --accum 4 --lr 1e-4 --T 128 `
+  --device cuda --save-every 100 --log-every 1 `
+  --lam-sem 0.4 --mse-weight 1500 --cos-weight 1.5 `
+  --lam-ce 1.5 --lam-ae 0.5 --lam-nce 0.03 --nce-temperature 0.07
 
 
 
@@ -54,5 +54,5 @@ python tools_eval_sonar_slt.py  --preds runs/sonar_slt_infer/preds.csv  --refere
 INFERENCIA:
 ------------
 
-python tools_infer_sonar_slt.py    --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --device auto --adapter-ckpt runs\sonar_slt_finetune_lsa\checkpoints\adapter_step000260.pt
+python tools_infer_sonar_slt.py    --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --device auto --adapter-ckpt runs\sonar_slt_finetune_lsa_v2\checkpoints\adapter_step000300.pt
 
