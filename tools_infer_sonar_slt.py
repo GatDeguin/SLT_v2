@@ -563,18 +563,32 @@ class SonarSLTInference(nn.Module):
             filtered_state["keypoint_bias"] = keypoint_bias_value
 
         if filtered_out:
-            print(
-                "[info] Ignoring adapter parameters not used during inference: "
-                f"{sorted(filtered_out)}"
-            )
+            filtered_out_sorted = sorted(filtered_out)
+            if len(filtered_out_sorted) <= 20:
+                LOGGER.info(
+                    "Ignoring adapter parameters not used during inference: %s",
+                    filtered_out_sorted,
+                )
+            else:
+                preview = ", ".join(filtered_out_sorted[:5])
+                LOGGER.info(
+                    "Ignoring %d adapter parameter(s) not used during inference (showing first 5: %s)",
+                    len(filtered_out_sorted),
+                    preview,
+                )
+                LOGGER.debug(
+                    "Full list of adapter parameters ignored during inference: %s",
+                    filtered_out_sorted,
+                )
 
         missing, unexpected = self.fusion_adapter.load_state_dict(filtered_state, strict=False)
         if missing:
             raise RuntimeError(f"Adapter checkpoint is missing parameters: {sorted(missing)}")
         if unexpected:
-            print(
-                "[warn] Adapter checkpoint has additional parameters even after filtering: "
-                f"{sorted(unexpected)}"
+            unexpected_sorted = sorted(unexpected)
+            LOGGER.warning(
+                "Adapter checkpoint has additional parameters even after filtering: %s",
+                unexpected_sorted,
             )
 
     @torch.no_grad()
