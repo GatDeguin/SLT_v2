@@ -475,14 +475,12 @@ def train(cfg: TrainConfig) -> None:
         target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
     )
     decoder = get_peft_model(decoder, lora_config).to(device)
-    if cfg.half and device.type == "cuda":
-        decoder.half()
+    # Keep the frozen decoder weights in FP32; autocast handles mixed-precision casts.
 
     # Bridge maps adapter’s 1024 to decoder d_model if needed
     d_model = getattr(decoder.config, "d_model", None) or getattr(decoder.config, "hidden_size", DEFAULT_D_MODEL)
     bridge = nn.Linear(1024, d_model, bias=False).to(device)
-    if cfg.half and device.type == "cuda":
-        bridge.half()
+    # Bridge remains FP32 so GradScaler can safely unscale gradients.
 
     adapter = VisualFusionAdapter(
         AdapterConfig(),
@@ -495,8 +493,7 @@ def train(cfg: TrainConfig) -> None:
         freeze_videomae=cfg.freeze_videomae,
         freeze_keypoint=cfg.freeze_keypoint,
     ).to(device)
-    if cfg.half and device.type == "cuda":
-        adapter.half()
+    # Adapter gradients must stay in FP32 for stable unscaling during AMP.
 
     text_pool = TextPooler(decoder, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)
 
