@@ -408,7 +408,7 @@ def _render_keypoint_preview(
 
     # Map from [-1, 1] to pixel coordinates.
     xs = ((coords[:, 0] + 1.0) * 0.5) * (width - 1)
-    ys = ((1.0 - (coords[:, 1] + 1.0) * 0.5)) * (height - 1)
+    ys = ((coords[:, 1] + 1.0) * 0.5) * (height - 1)
     points = np.stack([xs, ys], axis=-1)
     points = np.nan_to_num(points, nan=-1.0, posinf=-1.0, neginf=-1.0)
     points = points.astype(np.int32)
