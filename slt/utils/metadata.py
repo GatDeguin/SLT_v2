@@ -54,10 +54,10 @@ def _normalise_double_quotes(raw: str) -> str:
     """Replace Unicode fancy quotes with regular double quotes."""
 
     replacements = {
-        "“": '\\"',
-        "”": '\\"',
-        "‟": '\\"',
-        "„": '\\"',
+        "“": '"',
+        "”": '"',
+        "‟": '"',
+        "„": '"',
     }
     for source, target in replacements.items():
         raw = raw.replace(source, target)
