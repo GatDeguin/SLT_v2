@@ -702,6 +702,11 @@ def main():
     ap.add_argument("--num-beams", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument(
+        "--ignore-lora",
+        action="store_true",
+        help="Skip loading decoder LoRA weights/config even if present in the checkpoint",
+    )
+    ap.add_argument(
         "--sonar-model-dir",
         type=str,
         default=None,
@@ -756,6 +761,10 @@ def main():
         raise TypeError("Checkpoint key 'lora' must be a state dict when present")
     if lora_config_dict is not None and not isinstance(lora_config_dict, dict):
         raise TypeError("Checkpoint key 'lora_config' must be a mapping when present")
+    if args.ignore_lora and (lora_state is not None or lora_config_dict is not None):
+        LOGGER.info("Ignoring decoder LoRA weights/config as requested via --ignore-lora.")
+        lora_state = None
+        lora_config_dict = None
     if lora_state is None:
         if lora_config_dict is not None:
             LOGGER.warning(
@@ -822,11 +831,49 @@ def main():
             else:
                 kp_t = kp_t.float()
 
+            coords = kp[..., :2]
+            coords_min = float(coords.min())
+            coords_max = float(coords.max())
+            coords_std = float(coords.std())
+            conf = kp[..., 2:]
+            conf_min = float(conf.min())
+            conf_max = float(conf.max())
+            conf_std = float(conf.std())
+            LOGGER.info(
+                "[%s] keypoints coords min=%.4f max=%.4f std=%.4f | conf min=%.4f max=%.4f std=%.4f",
+                clip.clip_id,
+                coords_min,
+                coords_max,
+                coords_std,
+                conf_min,
+                conf_max,
+                conf_std,
+            )
+            kp_stats = {
+                "coords": {"min": coords_min, "max": coords_max, "std": coords_std},
+                "conf": {"min": conf_min, "max": conf_max, "std": conf_std},
+            }
+
             with torch.inference_mode():
                 z = model(kp_t)  # [1,1024]
 
             z = z.to(decoder.bridge.weight.device)
             z = z.to(decoder.bridge.weight.dtype)
+
+            z_float = z.float()
+            z_min = float(z_float.min().item())
+            z_max = float(z_float.max().item())
+            z_std = float(z_float.std(unbiased=False).item())
+            z_norm = float(z_float.norm(dim=-1).mean().item())
+            LOGGER.info(
+                "[%s] z stats min=%.4f max=%.4f std=%.4f norm=%.4f",
+                clip.clip_id,
+                z_min,
+                z_max,
+                z_std,
+                z_norm,
+            )
+            z_stats = {"min": z_min, "max": z_max, "std": z_std, "norm": z_norm}
 
             text = decoder.generate(
                 z,
@@ -843,6 +890,8 @@ def main():
                 "keypoints": str(clip.keypoints_path),
                 "lang": args.tgt_lang,
                 "text": text,
+                "kp_stats": kp_stats,
+                "z_stats": z_stats,
             }, ensure_ascii=False) + "\n")
             fh_log.flush()
             print(f"[ok] {clip.clip_id} → {text}")
