@@ -31,18 +31,18 @@ python visualize_keypoints_viewer.py    --videos-dir single_signer/videos  --key
 ENTRENAMIENTO:
 --------------
 
-python tools_finetune_sonar_slt.py   --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out runs\sonar_slt_finetune_lsa   --model-name mtmlt/sonar-nllb-200-1.3B   --tgt-lang spa_Latn   --epochs 50 --batch-size 8 --accum 2 --lr 3e-4 --T 128 --half --device cuda --save-every 200 --log-every 1
+python tools_finetune_sonar_slt.py   --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out runs\sonar_slt_finetune_lsa   --model-name mtmlt/sonar-nllb-200-1.3B   --tgt-lang spa_Latn   --epochs 1000 --batch-size 8 --accum 2 --lr 3e-4 --T 128 --half --device cuda --save-every 10 --log-every 1 --lam-nce 0.05 --nce-temperature 0.07
 
 
 
 EVALUACION:
 -----------
 
-python tools_infer_sonar_slt.py     --keypoints-dir data/single_signer/kp/keypoints     --csv meta.csv     --adapter-ckpt runs/sonar_slt_finetune_lsa/checkpoints/adapter_step006800.pt     --out runs/sonar_slt_eval_dev     --tgt-lang spa_Latn
+python tools_infer_sonar_slt.py     --keypoints-dir single_signer/kp/keypoints     --csv meta.csv     --adapter-ckpt runs/sonar_slt_finetune_lsa/checkpoints/adapter_step000190.pt     --out runs/sonar_slt_eval_dev     --tgt-lang spa_Latn
 
 
 INFERENCIA:
 ------------
 
-python tools_infer_sonar_slt.py    --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --device auto --adapter-ckpt runs\sonar_slt_finetune_lsa\checkpoints\adapter_step006600.pt
+python tools_infer_sonar_slt.py    --keypoints-dir single_signer\kp\keypoints   --csv meta.csv   --out slt\runs\sonar_slt_infer   --tgt-lang spa_Latn  --sonar-model-dir \  --device auto --adapter-ckpt runs\sonar_slt_finetune_lsa\checkpoints\adapter_step000210.pt
 
