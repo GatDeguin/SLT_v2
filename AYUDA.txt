@@ -33,6 +33,7 @@ ENTRENAMIENTO:
 
 python tools_finetune_sonar_slt.py `
   --keypoints-dir single_signer\kp\keypoints `
+  --video-dir single_signer\videos `
   --csv meta.csv `
   --out runs\sonar_slt_finetune_lsa_v2 `
   --tgt-lang spa_Latn `
