@@ -3,7 +3,29 @@ import sys
 import types
 from pathlib import Path
 
-import numpy as np
+
+def _ensure_numpy_stub():
+    if "numpy" in sys.modules:
+        return
+
+    class _NumpyStub(types.ModuleType):
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    numpy = _NumpyStub("numpy")
+    numpy.ndarray = object
+    numpy.float32 = "float32"
+    numpy.float64 = "float64"
+    numpy.int64 = "int64"
+
+    sys.modules["numpy"] = numpy
+
+
+try:  # pragma: no cover - exercised implicitly in environments with numpy
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - fallback for constrained envs
+    _ensure_numpy_stub()
+    import numpy as np
 
 
 class _DummyContext:
@@ -86,25 +108,6 @@ def _ensure_torch_stub():
     sys.modules["torch.nn.functional"] = torch_nn_functional
     sys.modules["torch.utils"] = torch.utils
     sys.modules["torch.utils.data"] = torch.utils.data
-
-
-def _ensure_numpy_stub():
-    if "numpy" in sys.modules:
-        return
-
-    class _NumpyStub(types.ModuleType):
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: None
-
-    numpy = _NumpyStub("numpy")
-    numpy.ndarray = object
-    numpy.float32 = "float32"
-    numpy.float64 = "float64"
-    numpy.int64 = "int64"
-
-    sys.modules["numpy"] = numpy
-
-
 def _ensure_transformers_stub():
     if "transformers" in sys.modules:
         return
