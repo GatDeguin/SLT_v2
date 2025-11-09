@@ -174,3 +174,110 @@ def test_pad_or_sample_behaviour(length: Iterable[int], target: int):
     arr = arr[:, None]
     adjusted = finetune.pad_or_sample(arr, target, axis=0)
     assert adjusted.shape[0] == target
+
+
+class DummyCV2:
+    COLOR_RGB2BGR = 0
+    COLOR_BGR2RGB = 1
+    LINE_AA = 16
+
+    def __init__(self) -> None:
+        self.circles: list[tuple[int, int]] = []
+        self.lines: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
+    def line(
+        self,
+        canvas: np.ndarray,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        colour: tuple[int, int, int],
+        thickness: int,
+        line_type: int,
+    ) -> np.ndarray:
+        self.lines.append((start, end))
+        for x, y in (start, end):
+            if 0 <= y < canvas.shape[0] and 0 <= x < canvas.shape[1]:
+                canvas[y, x] = colour
+        return canvas
+
+    def circle(
+        self,
+        canvas: np.ndarray,
+        center: tuple[int, int],
+        radius: int,
+        colour: tuple[int, int, int],
+        thickness: int,
+        line_type: int,
+    ) -> np.ndarray:
+        self.circles.append(center)
+        x, y = center
+        if 0 <= y < canvas.shape[0] and 0 <= x < canvas.shape[1]:
+            canvas[y, x] = colour
+        return canvas
+
+    def resize(self, arr: np.ndarray, size: tuple[int, int], interpolation: int) -> np.ndarray:
+        width, height = size
+        channels = arr.shape[2] if arr.ndim == 3 else 1
+        return np.zeros((height, width, channels), dtype=arr.dtype)
+
+    def cvtColor(self, arr: np.ndarray, code: int) -> np.ndarray:
+        return arr
+
+
+def test_render_keypoint_preview_with_unit_coordinates(monkeypatch: pytest.MonkeyPatch):
+    dummy_cv2 = DummyCV2()
+    monkeypatch.setattr(finetune, "cv2", dummy_cv2)
+    frame = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.5, 0.25, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    layout = {"body": [0, 1, 2]}
+    connections = {"body": [(0, 2), (2, 1)]}
+
+    image = finetune._render_keypoint_preview(
+        frame,
+        layout=layout,
+        connections=connections,
+        width=11,
+        height=13,
+        confidence_threshold=0.5,
+    )
+
+    assert image.shape == (13, 11, 3)
+    expected_points = [(0, 0), (10, 12), (5, 3)]  # (x, y)
+    for x, y in expected_points:
+        assert image[y, x].any(), f"expected drawing at pixel ({x}, {y})"
+    assert dummy_cv2.circles == expected_points
+
+
+def test_render_keypoint_preview_accepts_legacy_range(monkeypatch: pytest.MonkeyPatch):
+    dummy_cv2 = DummyCV2()
+    monkeypatch.setattr(finetune, "cv2", dummy_cv2)
+    frame = np.array(
+        [
+            [-1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    layout = {"body": [0, 1]}
+    connections = {"body": [(0, 1)]}
+
+    image = finetune._render_keypoint_preview(
+        frame,
+        layout=layout,
+        connections=connections,
+        width=9,
+        height=7,
+        confidence_threshold=0.5,
+    )
+
+    assert image.shape == (7, 9, 3)
+    expected_points = [(0, 0), (8, 6)]
+    for x, y in expected_points:
+        assert image[y, x].any(), f"expected drawing at pixel ({x}, {y})"
+    assert dummy_cv2.circles == expected_points
