@@ -61,7 +61,7 @@ import types
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -132,6 +132,15 @@ except Exception:  # pragma: no cover - ensure module import during tests
                 "Optional visual adapter dependencies are missing."
                 " Install project in editable mode to train the adapter."
             )
+
+try:  # pragma: no cover - optional dependency
+    from slt.data.lsa_t_multistream import (
+        _resolve_mediapipe_connections,
+        _resolve_mediapipe_layout,
+    )
+except Exception:  # pragma: no cover - keep training usable without dataset extras
+    _resolve_mediapipe_connections = None  # type: ignore[assignment]
+    _resolve_mediapipe_layout = None  # type: ignore[assignment]
 
 # -----------------------------
 # Constants / Layout helpers
@@ -326,6 +335,138 @@ class KPTextDataset(Dataset):
 # Model definitions live in `slt.utils.visual_adapter`
 # -----------------------------
 
+
+def _render_keypoint_preview(
+    frame: np.ndarray,
+    *,
+    layout: Dict[str, Sequence[int]],
+    connections: Dict[str, Sequence[Tuple[int, int]]],
+    width: int,
+    height: int,
+    confidence_threshold: float,
+    text: Optional[str] = None,
+    video_frame: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Render a preview image with keypoints and optional reference text."""
+
+    if cv2 is None:  # pragma: no cover - optional dependency
+        raise RuntimeError("OpenCV is required to render keypoint previews")
+
+    if frame.ndim != 2 or frame.shape[1] < 2:
+        raise ValueError("Expected frame with shape (N, C>=2) for keypoint preview")
+
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+
+    coords = np.asarray(frame[..., :2], dtype=np.float32)
+    conf = frame[..., 2] if frame.shape[1] > 2 else np.ones(frame.shape[0], dtype=np.float32)
+    conf = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Map from [-1, 1] to pixel coordinates.
+    xs = ((coords[:, 0] + 1.0) * 0.5) * (width - 1)
+    ys = ((1.0 - (coords[:, 1] + 1.0) * 0.5)) * (height - 1)
+    points = np.stack([xs, ys], axis=-1)
+    points = np.nan_to_num(points, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    points = points.astype(np.int32)
+
+    valid = conf >= float(confidence_threshold)
+
+    if video_frame is not None:
+        frame_np = video_frame
+        if isinstance(frame_np, torch.Tensor):
+            frame_np = frame_np.detach().cpu().numpy()
+        frame_np = np.asarray(frame_np)
+        if frame_np.ndim == 3 and frame_np.shape[0] in {1, 3}:  # (C,H,W) → (H,W,C)
+            frame_np = np.transpose(frame_np, (1, 2, 0))
+        frame_np = np.nan_to_num(frame_np, nan=0.0)
+        if frame_np.dtype != np.uint8:
+            frame_np = frame_np.astype(np.float32, copy=False)
+            max_val = 255.0 if frame_np.max() > 1.0 else 1.0
+            frame_np = np.clip(frame_np / max(max_val, 1e-6), 0.0, 1.0)
+            frame_np = (frame_np * 255.0).astype(np.uint8)
+        if frame_np.shape[0] != height or frame_np.shape[1] != width:
+            frame_np = cv2.resize(frame_np, (width, height), interpolation=cv2.INTER_LINEAR)
+        canvas = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+    else:
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
+    segment_colours = {
+        "body": (0, 255, 255),
+        "hand_l": (255, 144, 30),
+        "hand_r": (30, 144, 255),
+        "face": (144, 255, 144),
+    }
+
+    drawn: Set[int] = set()
+    for segment, pairs in connections.items():
+        colour = segment_colours.get(segment, (255, 255, 255))
+        for start, end in pairs:
+            if start >= points.shape[0] or end >= points.shape[0]:
+                continue
+            if not (valid[start] and valid[end]):
+                continue
+            cv2.line(
+                canvas,
+                tuple(points[start]),
+                tuple(points[end]),
+                colour,
+                2,
+                cv2.LINE_AA,
+            )
+            drawn.add(start)
+            drawn.add(end)
+
+    for segment, indices in layout.items():
+        colour = segment_colours.get(segment, (255, 255, 255))
+        for idx in indices:
+            if idx >= points.shape[0] or not valid[idx]:
+                continue
+            cv2.circle(canvas, tuple(points[idx]), 3, colour, -1, cv2.LINE_AA)
+            drawn.add(idx)
+
+    for idx in range(points.shape[0]):
+        if not valid[idx] or idx in drawn:
+            continue
+        cv2.circle(canvas, tuple(points[idx]), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+    if text:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 2
+        max_width = width - 20
+
+        def _wrap(line: str) -> List[str]:
+            words = line.split()
+            if not words:
+                return [""]
+            lines: List[str] = []
+            current: List[str] = []
+            for word in words:
+                tentative = " ".join(current + [word])
+                size, _ = cv2.getTextSize(tentative, font, font_scale, thickness)
+                if size[0] <= max_width or not current:
+                    current.append(word)
+                    continue
+                lines.append(" ".join(current))
+                current = [word]
+            if current:
+                lines.append(" ".join(current))
+            return lines
+
+        lines = []
+        for raw_line in str(text).splitlines():
+            lines.extend(_wrap(raw_line.strip()))
+
+        y = 24
+        for line in lines:
+            if not line:
+                y += 18
+                continue
+            cv2.putText(canvas, line, (10, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            y += int(18 * font_scale) + 12
+
+    return canvas
+
 # -----------------------------
 # Text encoder / pooling with SONAR HF port (M2M‑style mean pooling)
 # -----------------------------
@@ -428,6 +569,11 @@ class TrainConfig:
     freeze_keypoint: bool = False
     freeze_vit: bool = False
     freeze_videomae: bool = False
+    save_samples: bool = False
+    preview_width: int = 640
+    preview_height: int = 640
+    preview_confidence_threshold: float = 0.2
+    preview_seed: int = 1337
 
 
 def _cuda_is_available() -> bool:
@@ -582,6 +728,19 @@ def train(cfg: TrainConfig) -> None:
         pin_memory=(device.type == "cuda"),
     )
 
+    layout: Dict[str, List[int]] = {}
+    connections: Dict[str, List[Tuple[int, int]]] = {}
+    if _resolve_mediapipe_layout is not None and _resolve_mediapipe_connections is not None:
+        try:
+            layout = _resolve_mediapipe_layout(N)
+            connections = _resolve_mediapipe_connections(layout)
+        except Exception as exc:  # pragma: no cover - layout resolution is optional
+            layout = {}
+            connections = {}
+            print(f"[preview] Failed to resolve MediaPipe layout: {exc}")
+
+    preview_rng = random.Random(int(cfg.preview_seed))
+
     step = 0
     log_path = cfg.out_dir / "train_log.jsonl"
     accum_counter = 0
@@ -723,6 +882,65 @@ def train(cfg: TrainConfig) -> None:
                 path = cfg.out_dir / "checkpoints" / f"adapter_step{step:06d}.pt"
                 torch.save(ckpt, path)
                 print(f"[ckpt] Saved {path}")
+                if cfg.save_samples:
+                    preview_dir = cfg.out_dir / "checkpoints" / f"adapter_step{step:06d}" / "preview"
+                    with torch.no_grad():
+                        preview_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            sample_idx = preview_rng.randrange(len(ds))
+                            sample = ds[sample_idx]
+                        except Exception as exc:  # pragma: no cover - sampling is best-effort
+                            print(f"[preview] Failed to sample example: {exc}")
+                            sample = None
+
+                        if sample is not None:
+                            reference_path = preview_dir / "reference.txt"
+                            reference_text = f"id: {sample['id']}\ntext: {sample['text']}\n"
+                            reference_path.write_text(reference_text, encoding="utf-8")
+                            print(f"[preview] Saved reference text → {reference_path}")
+                            if cv2 is None:
+                                print("[preview] OpenCV not available; skipped keypoints.png generation.")
+                            else:
+                                try:
+                                    kp_tensor = sample["keypoints"].detach().cpu().numpy()
+                                    total_frames = kp_tensor.shape[0]
+                                    if total_frames <= 0:
+                                        raise ValueError("Sample contained no keypoint frames")
+                                    frame_conf = kp_tensor[..., 2] if kp_tensor.shape[-1] > 2 else np.ones(
+                                        kp_tensor.shape[:2], dtype=np.float32
+                                    )
+                                    frame_scores = frame_conf.mean(axis=1)
+                                    frame_idx = int(np.argmax(frame_scores)) if frame_scores.size else 0
+                                    frame_idx = max(0, min(frame_idx, total_frames - 1))
+                                    kp_frame = kp_tensor[frame_idx]
+
+                                    video_frame: Optional[np.ndarray] = None
+                                    video_tensor = sample.get("video") if isinstance(sample, dict) else None
+                                    if video_tensor is not None:
+                                        if isinstance(video_tensor, torch.Tensor):
+                                            video_np = video_tensor.detach().cpu().numpy()
+                                        else:
+                                            video_np = np.asarray(video_tensor)
+                                        if video_np.shape[0] == 0:
+                                            raise ValueError("Sample video contained no frames")
+                                        frame_idx_vid = max(0, min(frame_idx, video_np.shape[0] - 1))
+                                        video_frame = video_np[frame_idx_vid]
+
+                                    image = _render_keypoint_preview(
+                                        kp_frame,
+                                        layout=layout,
+                                        connections=connections,
+                                        width=cfg.preview_width,
+                                        height=cfg.preview_height,
+                                        confidence_threshold=cfg.preview_confidence_threshold,
+                                        text=f"{sample['id']}: {sample['text']}",
+                                        video_frame=video_frame,
+                                    )
+                                    image_path = preview_dir / "keypoints.png"
+                                    cv2.imwrite(str(image_path), image)
+                                    print(f"[preview] Saved sample preview → {image_path}")
+                                except Exception as exc:  # pragma: no cover - preview errors are non fatal
+                                    print(f"[preview] Failed to render keypoint preview: {exc}")
 
         if accum_counter != 0:
             scaler.step(opt)
@@ -796,6 +1014,21 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--freeze-vit", action="store_true")
     ap.add_argument("--freeze-videomae", action="store_true")
     ap.add_argument("--text-pool-layers", type=int, default=4)
+    ap.add_argument("--save-samples", action="store_true", help="Store preview samples alongside checkpoints")
+    ap.add_argument("--preview-width", type=int, default=640)
+    ap.add_argument("--preview-height", type=int, default=640)
+    ap.add_argument(
+        "--preview-confidence-threshold",
+        type=float,
+        default=0.2,
+        help="Minimum confidence required to draw a keypoint in previews",
+    )
+    ap.add_argument(
+        "--preview-seed",
+        type=int,
+        default=1337,
+        help="Random seed used to pick preview samples",
+    )
     args = ap.parse_args()
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
@@ -833,6 +1066,11 @@ def parse_args() -> TrainConfig:
         freeze_keypoint=bool(args.freeze_keypoint),
         freeze_vit=bool(args.freeze_vit),
         freeze_videomae=bool(args.freeze_videomae),
+        save_samples=bool(args.save_samples),
+        preview_width=int(args.preview_width),
+        preview_height=int(args.preview_height),
+        preview_confidence_threshold=float(args.preview_confidence_threshold),
+        preview_seed=int(args.preview_seed),
     )
 
 
