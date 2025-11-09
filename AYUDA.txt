@@ -38,7 +38,7 @@ python tools_finetune_sonar_slt.py   --keypoints-dir single_signer\kp\keypoints 
 EVALUACION:
 -----------
 
-python tools_infer_sonar_slt.py     --keypoints-dir single_signer/kp/keypoints     --csv meta.csv     --adapter-ckpt runs/sonar_slt_finetune_lsa/checkpoints/adapter_step000190.pt     --out runs/sonar_slt_eval_dev     --tgt-lang spa_Latn
+python tools_eval_sonar_slt.py  --preds runs/sonar_slt_infer/preds.csv  --references meta.csv  --split test  --output runs/sonar_slt_infer/metrics.json
 
 
 INFERENCIA:
