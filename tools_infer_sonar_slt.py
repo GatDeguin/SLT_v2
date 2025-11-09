@@ -192,7 +192,7 @@ def _resolve_device(name: str) -> torch.device:
         return torch.device("cpu")
     try:
         device = torch.device(cleaned)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RuntimeError):
         lowered = cleaned.lower()
         if lowered in {"cuda", "gpu"} and torch.cuda.is_available():
             return torch.device("cuda")
