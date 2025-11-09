@@ -337,6 +337,43 @@ class KPTextDataset(Dataset):
         arr = arr.transpose(0, 3, 1, 2)  # (T, C, H, W)
         return arr
 
+    def load_video_frame(
+        self,
+        vid: str,
+        *,
+        frame_index: int,
+        keypoint_frames: int,
+    ) -> Optional[np.ndarray]:
+        """Return a single clip-aligned frame for ``vid`` if videos are available."""
+
+        if self.video_dir is None:
+            return None
+
+        video_path = self._resolve_video_path(vid)
+        if video_path is None:
+            return None
+
+        video_np = self._load_video(video_path)
+        if video_np.size == 0 or video_np.shape[0] == 0:
+            return None
+
+        try:
+            video_np = pad_or_sample(video_np, self.clip_frames, axis=0)
+        except ValueError:
+            return None
+
+        if video_np.shape[0] == 0:
+            return None
+
+        if keypoint_frames > 1 and video_np.shape[0] > 1:
+            ratio = frame_index / float(max(keypoint_frames - 1, 1))
+            approx_idx = int(round(ratio * (video_np.shape[0] - 1)))
+        else:
+            approx_idx = 0
+        approx_idx = max(0, min(approx_idx, video_np.shape[0] - 1))
+
+        return video_np[approx_idx]
+
 
 # -----------------------------
 # Model definitions live in `slt.utils.visual_adapter`
@@ -983,8 +1020,22 @@ def train(cfg: TrainConfig) -> None:
                                         video_np = np.asarray(video_tensor)
                                     if video_np.shape[0] == 0:
                                         raise ValueError("Sample video contained no frames")
-                                    frame_idx_vid = max(0, min(frame_idx, video_np.shape[0] - 1))
+                                    if total_frames > 1 and video_np.shape[0] > 1:
+                                        ratio = frame_idx / float(max(total_frames - 1, 1))
+                                        frame_idx_vid = int(round(ratio * (video_np.shape[0] - 1)))
+                                    else:
+                                        frame_idx_vid = 0
+                                    frame_idx_vid = max(0, min(frame_idx_vid, video_np.shape[0] - 1))
                                     video_frame = video_np[frame_idx_vid]
+                                elif hasattr(ds, "load_video_frame"):
+                                    try:
+                                        video_frame = ds.load_video_frame(
+                                            sample["id"],
+                                            frame_index=frame_idx,
+                                            keypoint_frames=total_frames,
+                                        )
+                                    except Exception as exc:
+                                        print(f"[preview] Failed to fetch video frame: {exc}")
 
                                 image = _render_keypoint_preview(
                                     kp_frame,
