@@ -205,8 +205,9 @@ def test_load_adapter_converts_visual_fusion_state(capsys):
     assert "fusion.motion_proj.weight" not in fake_adapter.received_state
     assert "vit.encoder.layers.0.weight" not in fake_adapter.received_state
     assert "videomae.encoder.layers.0.bias" not in fake_adapter.received_state
-    assert "vit.encoder.layers.0.weight" in captured.out
-    assert "videomae.encoder.layers.0.bias" in captured.out
+    log_output = captured.out + captured.err
+    assert "vit.encoder.layers.0.weight" in log_output
+    assert "videomae.encoder.layers.0.bias" in log_output
 
 
 def test_flat_keypoints_extra_channels_trimmed():
@@ -220,8 +221,33 @@ def test_flat_keypoints_extra_channels_trimmed():
     reshaped = module.reshape_flat_keypoints(flat, num_landmarks)
 
     assert reshaped.shape == (timesteps, num_landmarks, module.KEYPOINT_CHANNELS)
-    expected = flat.reshape(timesteps, num_landmarks, 4)[..., : module.KEYPOINT_CHANNELS]
+    reshaped_full = flat.reshape(timesteps, num_landmarks, 4)
+    expected = np.concatenate(
+        [reshaped_full[..., :2], reshaped_full[..., -1:]], axis=-1
+    )
     np.testing.assert_array_equal(reshaped, expected)
+
+
+def test_normalise_keypoints_retains_confidence_track():
+    module = _import_module()
+    raw = np.array([
+        [[1.0, 2.0, 99.0, 0.9], [3.0, 4.0, 42.0, 0.8]],
+    ])
+
+    normalised = module.normalise_keypoints(raw)
+
+    assert normalised.shape == (1, 2, module.KEYPOINT_CHANNELS)
+
+    coords = raw[..., :2]
+    center = coords.mean(axis=-2, keepdims=True)
+    centered = coords - center
+    norms = np.linalg.norm(centered, axis=-1)
+    max_norm = np.max(norms, axis=-1, keepdims=True)
+    max_norm = np.clip(max_norm, 1e-4, None)
+    expected_coords = centered / max_norm[..., None]
+    expected = np.concatenate([expected_coords, raw[..., -1:]], axis=-1)
+
+    np.testing.assert_allclose(normalised, expected)
 
 
 def test_fusion_adapter_forward_adds_keypoint_bias():
