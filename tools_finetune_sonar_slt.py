@@ -496,9 +496,19 @@ def _render_keypoint_preview(
     conf = frame[..., 2] if frame.shape[1] > 2 else np.ones(frame.shape[0], dtype=np.float32)
     conf = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Map from [-1, 1] to pixel coordinates.
-    xs = ((coords[:, 0] + 1.0) * 0.5) * (width - 1)
-    ys = ((coords[:, 1] + 1.0) * 0.5) * (height - 1)
+    # Default to treating coordinates as being in the [0, 1] range, as produced by
+    # `LsaTMultiStream._sample_keypoints`. Fallback to the legacy [-1, 1]
+    # interpretation when we observe values outside the expected [0, 1] bounds.
+    xs = coords[:, 0] * (width - 1)
+    ys = coords[:, 1] * (height - 1)
+    finite_coords = coords[np.isfinite(coords)]
+    if finite_coords.size:
+        min_coord = float(finite_coords.min())
+        max_coord = float(finite_coords.max())
+        eps = 1e-3
+        if min_coord < -eps or max_coord > 1.0 + eps:
+            xs = ((coords[:, 0] + 1.0) * 0.5) * (width - 1)
+            ys = ((coords[:, 1] + 1.0) * 0.5) * (height - 1)
     points = np.stack([xs, ys], axis=-1)
     points = np.nan_to_num(points, nan=-1.0, posinf=-1.0, neginf=-1.0)
     points = points.astype(np.int32)
