@@ -3,6 +3,8 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+
 
 class _DummyContext:
     def __enter__(self):
@@ -205,6 +207,21 @@ def test_load_adapter_converts_visual_fusion_state(capsys):
     assert "videomae.encoder.layers.0.bias" not in fake_adapter.received_state
     assert "vit.encoder.layers.0.weight" in captured.out
     assert "videomae.encoder.layers.0.bias" in captured.out
+
+
+def test_flat_keypoints_extra_channels_trimmed():
+    module = _import_module()
+    num_landmarks = 543
+    timesteps = 2
+    flat = np.arange(timesteps * num_landmarks * 4, dtype=np.float32).reshape(
+        timesteps, num_landmarks * 4
+    )
+
+    reshaped = module.reshape_flat_keypoints(flat, num_landmarks)
+
+    assert reshaped.shape == (timesteps, num_landmarks, module.KEYPOINT_CHANNELS)
+    expected = flat.reshape(timesteps, num_landmarks, 4)[..., : module.KEYPOINT_CHANNELS]
+    np.testing.assert_array_equal(reshaped, expected)
 
 
 def test_fusion_adapter_forward_adds_keypoint_bias():
