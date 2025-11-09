@@ -129,7 +129,10 @@ class VideoMAEBackbone(nn.Module):
         pixel_values = frames.contiguous()
         outputs = self.model(pixel_values=pixel_values, output_hidden_states=False)
         hidden = outputs.last_hidden_state  # (B, tokens, hidden)
-        if getattr(self.model.config, "use_cls_token", True):
+        use_cls_token = getattr(self.model.config, "use_cls_token", None)
+        if use_cls_token is None:
+            use_cls_token = hasattr(self.model, "cls_token")
+        if use_cls_token:
             hidden = hidden[:, 1:, :]
         patches_per_frame = (height // self.patch_size) * (width // self.patch_size)
         tokens_per_frame = max(patches_per_frame, 1)
