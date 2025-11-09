@@ -85,6 +85,8 @@ def detect_delimiter(path: Path, requested: Optional[str]) -> str:
 
 
 def read_csv(path: Path, delimiter: Optional[str]) -> List[Dict[str, str]]:
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found: {path.resolve()}")
     delim = detect_delimiter(path, delimiter)
     with path.open("r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh, delimiter=delim)
