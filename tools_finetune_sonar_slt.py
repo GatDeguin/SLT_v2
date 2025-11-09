@@ -317,10 +317,40 @@ class KPTextDataset(Dataset):
     def _resolve_video_path(self, stem: str) -> Optional[Path]:
         if self.video_dir is None:
             return None
-        for ext in VIDEO_EXTENSIONS:
-            candidate = self.video_dir / f"{stem}{ext}"
-            if candidate.exists():
-                return candidate
+
+        raw = stem.strip()
+        if not raw:
+            return None
+
+        candidates: List[str] = []
+
+        def _push(value: str) -> None:
+            normalised = value.strip()
+            if normalised and normalised not in candidates:
+                candidates.append(normalised)
+
+        _push(raw)
+        _push(raw.lower())
+
+        raw_path = Path(raw)
+        if raw_path.suffix:
+            _push(raw_path.stem)
+            _push(raw_path.stem.lower())
+
+        for name in candidates:
+            literal = self.video_dir / name
+            if literal.exists():
+                return literal
+
+            # Only append extensions when the candidate does not already provide one.
+            if Path(name).suffix:
+                continue
+
+            for ext in VIDEO_EXTENSIONS:
+                candidate = self.video_dir / f"{name}{ext}"
+                if candidate.exists():
+                    return candidate
+
         return None
 
     def _load_video(self, path: Path) -> np.ndarray:
