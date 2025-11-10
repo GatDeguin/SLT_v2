@@ -36,6 +36,16 @@ Training or running the new visual fusion adapter requires additional packages:
 pip install timm transformers[video] opencv-python
 ```
 
+## Inference defaults for `tools_infer_sonar_slt.py`
+
+The inference helper reads the saved training configuration from adapter checkpoints.
+When `--sonar-model-dir` is omitted the script reuses the `model_name` that was used
+for training; specifying a different decoder explicitly will raise a warning so you
+can double-check the mismatch. Likewise, when `--tgt-lang` is not provided the
+checkpoint's `tgt_lang` value becomes the default so that the generated text matches
+the fine-tuning target language. If the checkpoint lacks these fields the script
+falls back to the previous defaults (`mtmlt/sonar-nllb-200-1.3B` and `spa_Latn`).
+
 ## Fine-tuning with InfoNCE alignment
 
 The `tools_finetune_sonar_slt.py` helper exposes an optional InfoNCE term that

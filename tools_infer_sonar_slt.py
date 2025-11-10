@@ -84,6 +84,8 @@ else:
     LOGGER.propagate = False
 
 KEYPOINT_CHANNELS = 3  # (x, y, conf)
+DEFAULT_SONAR_MODEL_NAME = "mtmlt/sonar-nllb-200-1.3B"
+DEFAULT_TGT_LANG = "spa_Latn"
 
 
 def reshape_flat_keypoints(
@@ -312,7 +314,7 @@ class SonarDecoder:
     ):
         self.device = device
         # Matches TrainConfig.model_name to ensure existing bridge checkpoints load without changes.
-        default_model = "mtmlt/sonar-nllb-200-1.3B"
+        default_model = DEFAULT_SONAR_MODEL_NAME
 
         def _clean_path(path: Optional[str]) -> Optional[str]:
             if path is None:
@@ -641,7 +643,15 @@ def main():
     )
     ap.add_argument("--csv", type=Path, required=True, help="meta.csv with an 'id' or 'video' column")
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--tgt-lang", type=str, default="spa_Latn", help="NLLB language token, e.g., 'deu_Latn', 'eng_Latn', 'spa_Latn'")
+    ap.add_argument(
+        "--tgt-lang",
+        type=str,
+        default=None,
+        help=(
+            "NLLB language token. Defaults to the checkpoint's target language when available,"
+            " otherwise 'spa_Latn'."
+        ),
+    )
     ap.add_argument("--T", type=int, default=128, help="Temporal length for keypoints")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--half", action="store_true")
@@ -656,7 +666,10 @@ def main():
         "--sonar-model-dir",
         type=str,
         default=None,
-        help="Path or HF repo for SONAR decoder override (default: 'mtmlt/sonar-nllb-200-1.3B')",
+        help=(
+            "Path or HF repo for SONAR decoder override. Defaults to the training checkpoint's"
+            " model name when recorded, otherwise 'mtmlt/sonar-nllb-200-1.3B'."
+        ),
     )
     ap.add_argument(
         "--adapter-device",
@@ -665,6 +678,9 @@ def main():
         help="Device for loading the adapter checkpoint (e.g., 'cpu', 'cuda')",
     )
     args = ap.parse_args()
+    cli_args = sys.argv[1:]
+    tgt_lang_from_cli = any(arg.startswith("--tgt-lang") for arg in cli_args)
+    sonar_model_from_cli = any(arg.startswith("--sonar-model-dir") for arg in cli_args)
 
     device = _resolve_device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -689,6 +705,17 @@ def main():
         ckpt = torch.load(args.adapter_ckpt, map_location=adapter_map_device)
     except (RuntimeError, OSError, ValueError, EOFError) as exc:
         raise RuntimeError(f"Failed to load adapter checkpoint '{args.adapter_ckpt}': {exc}") from exc
+
+    config_raw = ckpt.get("config")
+    if config_raw is None:
+        LOGGER.warning(
+            "Checkpoint does not include a 'config' section; falling back to CLI/default decoder settings."
+        )
+        config: Dict[str, Any] = {}
+    elif isinstance(config_raw, dict):
+        config = dict(config_raw)
+    else:
+        raise TypeError("Checkpoint key 'config' must be a mapping when present")
 
     required_keys = {"adapter", "bridge", "num_landmarks"}
     missing_keys = [key for key in required_keys if key not in ckpt]
@@ -724,6 +751,93 @@ def main():
         if lora_config_dict is None:
             LOGGER.warning(
                 "LoRA weights detected without a config; falling back to default SONAR LoRA settings."
+            )
+
+    config_model_name_raw = config.get("model_name")
+    config_model_name: Optional[str]
+    if isinstance(config_model_name_raw, str) and config_model_name_raw.strip():
+        config_model_name = config_model_name_raw.strip()
+    else:
+        if config_model_name_raw is not None and not isinstance(config_model_name_raw, str):
+            LOGGER.warning(
+                "Ignoring non-string 'model_name' from checkpoint config: %r",
+                config_model_name_raw,
+            )
+        config_model_name = None
+
+    if not sonar_model_from_cli:
+        if config_model_name:
+            args.sonar_model_dir = config_model_name
+            LOGGER.info("Using SONAR decoder '%s' from checkpoint config.", args.sonar_model_dir)
+        else:
+            args.sonar_model_dir = DEFAULT_SONAR_MODEL_NAME
+            LOGGER.info(
+                "Using default SONAR decoder '%s' (checkpoint config missing model name).",
+                args.sonar_model_dir,
+            )
+    else:
+        if args.sonar_model_dir:
+            args.sonar_model_dir = args.sonar_model_dir.strip() or None
+        if not args.sonar_model_dir:
+            if config_model_name:
+                args.sonar_model_dir = config_model_name
+                LOGGER.info(
+                    "Using SONAR decoder '%s' from checkpoint config (CLI value was empty).",
+                    args.sonar_model_dir,
+                )
+            else:
+                args.sonar_model_dir = DEFAULT_SONAR_MODEL_NAME
+                LOGGER.info(
+                    "Using default SONAR decoder '%s' (CLI value was empty).",
+                    args.sonar_model_dir,
+                )
+        elif args.sonar_model_dir and config_model_name and args.sonar_model_dir != config_model_name:
+            LOGGER.warning(
+                "CLI SONAR decoder '%s' differs from training model '%s'; proceeding with user override.",
+                args.sonar_model_dir,
+                config_model_name,
+            )
+        elif args.sonar_model_dir:
+            LOGGER.info("Using SONAR decoder '%s' from CLI.", args.sonar_model_dir)
+
+    config_tgt_lang_raw = config.get("tgt_lang")
+    config_tgt_lang: Optional[str]
+    if isinstance(config_tgt_lang_raw, str) and config_tgt_lang_raw.strip():
+        config_tgt_lang = config_tgt_lang_raw.strip()
+    else:
+        if config_tgt_lang_raw is not None and not isinstance(config_tgt_lang_raw, str):
+            LOGGER.warning(
+                "Ignoring non-string 'tgt_lang' from checkpoint config: %r",
+                config_tgt_lang_raw,
+            )
+        config_tgt_lang = None
+
+    if tgt_lang_from_cli and args.tgt_lang:
+        args.tgt_lang = args.tgt_lang.strip()
+        if args.tgt_lang:
+            LOGGER.info("Using target language '%s' from CLI.", args.tgt_lang)
+        else:
+            if config_tgt_lang:
+                args.tgt_lang = config_tgt_lang
+                LOGGER.info(
+                    "Using target language '%s' from checkpoint config (CLI value was empty).",
+                    args.tgt_lang,
+                )
+            else:
+                args.tgt_lang = DEFAULT_TGT_LANG
+                LOGGER.info(
+                    "Using default target language '%s' (CLI value was empty).",
+                    args.tgt_lang,
+                )
+    else:
+        if config_tgt_lang:
+            args.tgt_lang = config_tgt_lang
+            LOGGER.info("Using target language '%s' from checkpoint config.", args.tgt_lang)
+        else:
+            args.tgt_lang = DEFAULT_TGT_LANG
+            LOGGER.info(
+                "Using default target language '%s' (checkpoint config missing target language).",
+                args.tgt_lang,
             )
 
     num_landmarks = int(ckpt.get("num_landmarks") or 0)
