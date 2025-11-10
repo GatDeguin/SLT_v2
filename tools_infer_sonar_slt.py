@@ -417,7 +417,21 @@ class SonarDecoder:
             self.bridge.half()
 
     @torch.no_grad()
-    def generate(self, z_bD: torch.Tensor, tgt_lang: str, max_new_tokens: int = 64, num_beams: int = 4) -> List[str]:
+    def generate(
+        self,
+        z_bD: torch.Tensor,
+        tgt_lang: str,
+        *,
+        max_new_tokens: int = 64,
+        num_beams: int = 4,
+        do_sample: bool = False,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
+        length_penalty: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+    ) -> List[str]:
         if self.bridge is None:
             raise RuntimeError("Bridge weights have not been loaded. Call load_bridge() before generation")
         # Build pseudo encoder outputs from z as a single‑token memory
@@ -432,6 +446,13 @@ class SonarDecoder:
             tgt_lang,
             max_new_tokens=max_new_tokens,
             num_beams=num_beams,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            length_penalty=length_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
         )
 
 
@@ -657,6 +678,28 @@ def main():
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--num-beams", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--do-sample", action="store_true", help="Enable sampling instead of pure beam search")
+    ap.add_argument("--temperature", type=float, default=1.0, help="Softmax temperature for sampling")
+    ap.add_argument("--top-p", type=float, default=1.0, help="Top-p nucleus sampling threshold")
+    ap.add_argument("--top-k", type=int, default=50, help="Top-k sampling cutoff")
+    ap.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
+        help="Penalty applied to discourage token repetition",
+    )
+    ap.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=0,
+        help="Prevent repeating n-grams of this size (0 disables the constraint)",
+    )
+    ap.add_argument(
+        "--length-penalty",
+        type=float,
+        default=1.0,
+        help="Length penalty applied during beam search",
+    )
     ap.add_argument(
         "--ignore-lora",
         action="store_true",
@@ -940,6 +983,13 @@ def main():
                 tgt_lang=args.tgt_lang,
                 max_new_tokens=args.max_new_tokens,
                 num_beams=args.num_beams,
+                do_sample=args.do_sample,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                length_penalty=args.length_penalty,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
             )[0]
 
             video_name = clip.video_name or clip.clip_id
