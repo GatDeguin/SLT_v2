@@ -74,6 +74,13 @@ def generate_from_hidden_states(
     *,
     max_new_tokens: int = 64,
     num_beams: int = 4,
+    do_sample: bool = False,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
+    length_penalty: float = 1.0,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 50,
 ) -> List[str]:
     """Decode text from encoder hidden states using SONAR/NLLB decoder."""
 
@@ -88,7 +95,13 @@ def generate_from_hidden_states(
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
         num_beams=num_beams,
-        do_sample=False,
+        do_sample=do_sample,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        length_penalty=length_penalty,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
         forced_bos_token_id=forced_bos_id,
         decoder_start_token_id=forced_bos_id,
         use_cache=True,

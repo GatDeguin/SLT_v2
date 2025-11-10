@@ -46,6 +46,11 @@ checkpoint's `tgt_lang` value becomes the default so that the generated text mat
 the fine-tuning target language. If the checkpoint lacks these fields the script
 falls back to the previous defaults (`mtmlt/sonar-nllb-200-1.3B` and `spa_Latn`).
 
+Runtime generation can now be tuned from the CLI as well: pass `--do-sample` to
+switch to sampling and combine it with knobs such as `--temperature`, `--top-p`,
+`--top-k`, `--repetition-penalty`, `--no-repeat-ngram-size`, and
+`--length-penalty` to better match your quality/fluency trade-offs.
+
 ## Fine-tuning with InfoNCE alignment
 
 The `tools_finetune_sonar_slt.py` helper exposes an optional InfoNCE term that
