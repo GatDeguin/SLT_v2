@@ -1,11 +1,15 @@
 """Shared helpers for SONAR-SLT decoding."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import GenerationConfig
 from transformers.modeling_outputs import BaseModelOutput
+
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_lang_token_id(tokenizer, model, lang_code: str) -> Optional[int]:
@@ -141,6 +145,25 @@ def generate_from_hidden_states(
         eos_token_id=_resolve_special_token_id(tokenizer, decoder, "eos_token_id", forced_bos_id),
         use_cache=True,
     )
+    if logger.isEnabledFor(logging.INFO):
+        generation_log = {
+            "bos_id": forced_bos_id,
+            "pad_id": gen_cfg.pad_token_id,
+            "eos_id": gen_cfg.eos_token_id,
+            "repetition_penalty": gen_cfg.repetition_penalty,
+            "no_repeat_ngram_size": gen_cfg.no_repeat_ngram_size,
+            "do_sample": gen_cfg.do_sample,
+            "num_beams": gen_cfg.num_beams,
+            "max_new_tokens": gen_cfg.max_new_tokens,
+            "length_penalty": gen_cfg.length_penalty,
+            "temperature": gen_cfg.temperature,
+            "top_p": gen_cfg.top_p,
+            "top_k": gen_cfg.top_k,
+        }
+        logger.info(
+            "decoder.generate parameters",
+            extra={"generation_parameters": generation_log},
+        )
     outputs = decoder.generate(
         encoder_outputs=BaseModelOutput(last_hidden_state=hidden_states),
         decoder_input_ids=None,
