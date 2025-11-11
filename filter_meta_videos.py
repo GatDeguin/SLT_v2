@@ -10,6 +10,12 @@ VIDEO_EXTS: tuple[str, ...] = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
 def find_video(clip_id: str, videos_dir: Path) -> Path | None:
     """Return a matching video path for ``clip_id`` or ``None`` if missing."""
+    if clip_id is None:
+        return None
+    clip_id = clip_id.strip() if isinstance(clip_id, str) else str(clip_id).strip()
+    if not clip_id:
+        return None
+
     for ext in VIDEO_EXTS:
         candidate = videos_dir / f"{clip_id}{ext}"
         if candidate.exists():
@@ -24,7 +30,8 @@ def filter_meta(rows: Iterable[dict[str, str]], videos_dir: Path) -> List[dict[s
         clip_id = row.get("id") or row.get("video_id") or row.get("video")
         if not clip_id:
             raise ValueError("meta.csv must contain an 'id', 'video_id', or 'video' column")
-        if find_video(clip_id, videos_dir):
+        clip_id = "" if clip_id is None else str(clip_id).strip()
+        if clip_id and find_video(clip_id, videos_dir):
             filtered.append(row)
     return filtered
 
