@@ -422,15 +422,7 @@ class SonarDecoder:
         z_bD: torch.Tensor,
         tgt_lang: str,
         *,
-        max_new_tokens: int = 64,
-        num_beams: int = 4,
-        do_sample: bool = False,
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0,
-        length_penalty: float = 1.0,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        generation_options: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         if self.bridge is None:
             raise RuntimeError("Bridge weights have not been loaded. Call load_bridge() before generation")
@@ -439,20 +431,13 @@ class SonarDecoder:
         z = z_bD.to(self.bridge.weight.device)
         z = z.to(self.bridge.weight.dtype)
         mem = self.bridge(z).unsqueeze(1)  # [B,1,d_model]
+        options = dict(generation_options) if generation_options else None
         return generate_from_hidden_states(
             self.model,
             self.tok,
             mem,
             tgt_lang,
-            max_new_tokens=max_new_tokens,
-            num_beams=num_beams,
-            do_sample=do_sample,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            length_penalty=length_penalty,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
+            generation_options=options,
         )
 
 
@@ -678,9 +663,23 @@ def main():
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--num-beams", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=64)
-    ap.add_argument("--do-sample", action="store_true", help="Enable sampling instead of pure beam search")
-    ap.add_argument("--temperature", type=float, default=1.0, help="Softmax temperature for sampling")
-    ap.add_argument("--top-p", type=float, default=1.0, help="Top-p nucleus sampling threshold")
+    ap.add_argument(
+        "--do-sample",
+        action="store_true",
+        help="Enable sampling instead of pure beam search",
+    )
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature for sampling",
+    )
+    ap.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Top-p nucleus sampling threshold",
+    )
     ap.add_argument("--top-k", type=int, default=50, help="Top-k sampling cutoff")
     ap.add_argument(
         "--repetition-penalty",
@@ -909,6 +908,18 @@ def main():
     preds_path = args.out / "preds.csv"
     logs_path = args.out / "logs.jsonl"
 
+    generation_kwargs = {
+        "max_new_tokens": args.max_new_tokens,
+        "num_beams": args.num_beams,
+        "do_sample": args.do_sample,
+        "repetition_penalty": args.repetition_penalty,
+        "no_repeat_ngram_size": args.no_repeat_ngram_size,
+        "length_penalty": args.length_penalty,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+    }
+
     with preds_path.open("w", newline="", encoding="utf-8") as fh_csv, logs_path.open("w", encoding="utf-8") as fh_log:
         w = csv.writer(fh_csv)
         w.writerow(["id", "video", "lang", "text"])  # header
@@ -981,15 +992,7 @@ def main():
             text = decoder.generate(
                 z,
                 tgt_lang=args.tgt_lang,
-                max_new_tokens=args.max_new_tokens,
-                num_beams=args.num_beams,
-                do_sample=args.do_sample,
-                repetition_penalty=args.repetition_penalty,
-                no_repeat_ngram_size=args.no_repeat_ngram_size,
-                length_penalty=args.length_penalty,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
+                generation_options=generation_kwargs,
             )[0]
 
             video_name = clip.video_name or clip.clip_id

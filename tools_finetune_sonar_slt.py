@@ -874,8 +874,10 @@ def _generate_sample_prediction(
                 tokenizer,
                 mem,
                 cfg.tgt_lang,
-                max_new_tokens=cfg.sample_max_new_tokens,
-                num_beams=cfg.sample_num_beams,
+                generation_options={
+                    "max_new_tokens": cfg.sample_max_new_tokens,
+                    "num_beams": cfg.sample_num_beams,
+                },
             )
             if not outputs:
                 return ""
