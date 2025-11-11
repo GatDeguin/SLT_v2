@@ -137,6 +137,11 @@ def generate_from_hidden_states(
         )
 
     config_kwargs = _build_generation_config_kwargs(generation_options)
+    max_new_tokens = config_kwargs.get("max_new_tokens", DEFAULT_GENERATION_OPTIONS["max_new_tokens"])
+    if max_new_tokens is None:
+        max_new_tokens = DEFAULT_GENERATION_OPTIONS["max_new_tokens"]
+        config_kwargs["max_new_tokens"] = max_new_tokens
+    config_kwargs.setdefault("max_length", max_new_tokens + 1)
     resolved_pad_id = _resolve_special_token_id(
         tokenizer, decoder, "pad_token_id", forced_bos_id
     )
@@ -153,6 +158,7 @@ def generate_from_hidden_states(
 
     gen_cfg = GenerationConfig(
         **config_kwargs,
+        bos_token_id=forced_bos_id,
         forced_bos_token_id=forced_bos_id,
         decoder_start_token_id=forced_bos_id,
         pad_token_id=resolved_pad_id,
@@ -175,10 +181,7 @@ def generate_from_hidden_states(
             "top_p": gen_cfg.top_p,
             "top_k": gen_cfg.top_k,
         }
-        logger.info(
-            "decoder.generate parameters",
-            extra={"generation_parameters": generation_log},
-        )
+        logger.info("decoder.generate parameters: %s", generation_log)
     outputs = decoder.generate(
         encoder_outputs=BaseModelOutput(last_hidden_state=hidden_states),
         decoder_input_ids=None,
