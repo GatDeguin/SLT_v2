@@ -137,11 +137,25 @@ def generate_from_hidden_states(
         )
 
     config_kwargs = _build_generation_config_kwargs(generation_options)
+    resolved_pad_id = _resolve_special_token_id(
+        tokenizer, decoder, "pad_token_id", forced_bos_id
+    )
+    pad_resolution_source = "pad_token"
+    tokenizer_pad_id = getattr(tokenizer, "pad_token_id", None)
+    tokenizer_eos_id = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_pad_id is None and isinstance(tokenizer_eos_id, int):
+        resolved_pad_id = tokenizer_eos_id
+        pad_resolution_source = "eos_token"
+        logger.debug(
+            "Using eos_token_id as pad_token_id for generation (id=%s)",
+            tokenizer_eos_id,
+        )
+
     gen_cfg = GenerationConfig(
         **config_kwargs,
         forced_bos_token_id=forced_bos_id,
         decoder_start_token_id=forced_bos_id,
-        pad_token_id=_resolve_special_token_id(tokenizer, decoder, "pad_token_id", forced_bos_id),
+        pad_token_id=resolved_pad_id,
         eos_token_id=_resolve_special_token_id(tokenizer, decoder, "eos_token_id", forced_bos_id),
         use_cache=True,
     )
@@ -150,6 +164,7 @@ def generate_from_hidden_states(
             "bos_id": forced_bos_id,
             "pad_id": gen_cfg.pad_token_id,
             "eos_id": gen_cfg.eos_token_id,
+            "pad_source": pad_resolution_source,
             "repetition_penalty": gen_cfg.repetition_penalty,
             "no_repeat_ngram_size": gen_cfg.no_repeat_ngram_size,
             "do_sample": gen_cfg.do_sample,
