@@ -513,6 +513,13 @@ class SonarSLTInference(nn.Module):
             raise TypeError("Adapter state must be a state dict mapping strings to tensors")
 
         state_dict: Dict[str, torch.Tensor] = dict(adapter_state)
+        expected_keys = set(self.fusion_adapter.state_dict().keys())
+        expects_keypoint_bias = "keypoint_bias" in expected_keys
+        expects_modality_embeddings = any(
+            key == "fusion.modality_embeddings"
+            or key.startswith("fusion.modality_embeddings.")
+            for key in expected_keys
+        )
 
         def _extract_bias_candidate(value: Any) -> Optional[torch.Tensor]:
             candidate = None
@@ -556,21 +563,20 @@ class SonarSLTInference(nn.Module):
                 converted_state[key] = value
             state_dict = converted_state
 
-        modality_keys = [
-            key
-            for key in state_dict
-            if key == "fusion.modality_embeddings"
-            or key.startswith("fusion.modality_embeddings.")
-        ]
-        for key in modality_keys:
-            value = state_dict.pop(key)
-            if keypoint_bias_value is not None:
-                continue
-            candidate = _extract_bias_candidate(value)
-            if candidate is not None:
-                keypoint_bias_value = candidate
-
-        expected_keys = set(self.fusion_adapter.state_dict().keys())
+        if expects_keypoint_bias and not expects_modality_embeddings:
+            modality_keys = [
+                key
+                for key in state_dict
+                if key == "fusion.modality_embeddings"
+                or key.startswith("fusion.modality_embeddings.")
+            ]
+            for key in modality_keys:
+                value = state_dict.pop(key)
+                if keypoint_bias_value is not None:
+                    continue
+                candidate = _extract_bias_candidate(value)
+                if candidate is not None:
+                    keypoint_bias_value = candidate
         filtered_state: Dict[str, torch.Tensor] = {}
         filtered_out: List[str] = []
         for key, value in state_dict.items():
