@@ -1,7 +1,7 @@
 """Shared helpers for SONAR-SLT decoding."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import GenerationConfig
@@ -85,21 +85,42 @@ def _resolve_special_token_id(tokenizer, model, attr_name: str, fallback: int) -
     return fallback
 
 
+DEFAULT_GENERATION_OPTIONS: Dict[str, Any] = {
+    "max_new_tokens": 64,
+    "num_beams": 4,
+    "do_sample": False,
+    "repetition_penalty": 1.0,
+    "no_repeat_ngram_size": 0,
+    "length_penalty": 1.0,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+}
+
+ALLOWED_GENERATION_OPTION_KEYS = frozenset(DEFAULT_GENERATION_OPTIONS.keys())
+
+
+def _build_generation_config_kwargs(
+    overrides: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    config_kwargs = dict(DEFAULT_GENERATION_OPTIONS)
+    if overrides:
+        filtered = {
+            k: v
+            for k, v in overrides.items()
+            if k in ALLOWED_GENERATION_OPTION_KEYS and v is not None
+        }
+        config_kwargs.update(filtered)
+    return config_kwargs
+
+
 def generate_from_hidden_states(
     decoder,
     tokenizer,
     hidden_states: torch.Tensor,
     lang_code: str,
     *,
-    max_new_tokens: int = 64,
-    num_beams: int = 4,
-    do_sample: bool = False,
-    repetition_penalty: float = 1.0,
-    no_repeat_ngram_size: int = 0,
-    length_penalty: float = 1.0,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-    top_k: int = 50,
+    generation_options: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Decode text from encoder hidden states using SONAR/NLLB decoder."""
 
@@ -111,16 +132,9 @@ def generate_from_hidden_states(
             f"Known languages (sample): {preview}"
         )
 
+    config_kwargs = _build_generation_config_kwargs(generation_options)
     gen_cfg = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        num_beams=num_beams,
-        do_sample=do_sample,
-        repetition_penalty=repetition_penalty,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-        length_penalty=length_penalty,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
+        **config_kwargs,
         forced_bos_token_id=forced_bos_id,
         decoder_start_token_id=forced_bos_id,
         pad_token_id=_resolve_special_token_id(tokenizer, decoder, "pad_token_id", forced_bos_id),
