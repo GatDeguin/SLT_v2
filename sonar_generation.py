@@ -28,9 +28,14 @@ def resolve_lang_token_id(tokenizer, model, lang_code: str) -> Optional[int]:
         if token_id is not None:
             return token_id
 
-    token_id = tokenizer.convert_tokens_to_ids(lang_code)
-    if isinstance(token_id, int) and token_id != getattr(tokenizer, "unk_token_id", None):
-        return token_id
+    candidate_tokens = [lang_code]
+    if lang_code and not lang_code.startswith("__"):
+        candidate_tokens.append(f"__{lang_code}__")
+
+    for candidate in candidate_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(candidate)
+        if isinstance(token_id, int) and token_id != getattr(tokenizer, "unk_token_id", None):
+            return token_id
 
     additional_tokens = getattr(tokenizer, "additional_special_tokens", None)
     additional_ids = getattr(tokenizer, "additional_special_tokens_ids", None)
@@ -64,6 +69,20 @@ def _available_lang_preview(tokenizer) -> str:
         return "unknown"
     preview = sorted(available_langs)
     return ", ".join(preview[:10])
+
+
+def _resolve_special_token_id(tokenizer, model, attr_name: str, fallback: int) -> int:
+    for source in (tokenizer, getattr(model, "config", None), model):
+        if source is None:
+            continue
+        token_id = getattr(source, attr_name, None)
+        if isinstance(token_id, int):
+            return token_id
+        if isinstance(token_id, (list, tuple)) and token_id:
+            first = token_id[0]
+            if isinstance(first, int):
+                return first
+    return fallback
 
 
 def generate_from_hidden_states(
@@ -104,6 +123,8 @@ def generate_from_hidden_states(
         top_k=top_k,
         forced_bos_token_id=forced_bos_id,
         decoder_start_token_id=forced_bos_id,
+        pad_token_id=_resolve_special_token_id(tokenizer, decoder, "pad_token_id", forced_bos_id),
+        eos_token_id=_resolve_special_token_id(tokenizer, decoder, "eos_token_id", forced_bos_id),
         use_cache=True,
     )
     outputs = decoder.generate(
