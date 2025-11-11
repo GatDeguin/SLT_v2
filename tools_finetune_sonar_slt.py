@@ -155,6 +155,7 @@ from tools_eval_sonar_slt import (
     Example as EvalExample,
     compute_metrics as eval_compute_metrics,
 )
+from tools_keypoint_utils import extract_confidence_channel
 
 # -----------------------------
 # Constants / Layout helpers
@@ -233,7 +234,7 @@ def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     Expects (T, N, C≥2). Returns same shape (T, N, 3).
     """
     coords = arr[..., :2]
-    conf = arr[..., 2:3] if arr.shape[-1] >= 3 else np.ones_like(coords[..., :1])
+    conf = extract_confidence_channel(arr, expected_channels=KEYPOINT_CHANNELS)
     center = coords.mean(axis=-2, keepdims=True)
     centered = coords - center
     norms = np.linalg.norm(centered, axis=-1)

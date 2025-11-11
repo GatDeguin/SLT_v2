@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from tools_keypoint_utils import extract_confidence_channel
 
 try:
     from transformers import (
@@ -153,12 +154,7 @@ def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     Expects (T, N, C≥2). Returns same shape (T, N, 3).
     """
     coords = arr[..., :2]
-    if arr.shape[-1] > KEYPOINT_CHANNELS:
-        conf = arr[..., -1:]
-    elif arr.shape[-1] >= KEYPOINT_CHANNELS:
-        conf = arr[..., 2:3]
-    else:
-        conf = np.ones_like(coords[..., :1])
+    conf = extract_confidence_channel(arr, expected_channels=KEYPOINT_CHANNELS)
     center = coords.mean(axis=-2, keepdims=True)
     centered = coords - center
     norms = np.linalg.norm(centered, axis=-1)
