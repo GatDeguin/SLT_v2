@@ -11,6 +11,7 @@ import torch.nn as nn
 import pytest
 
 import tools_finetune_sonar_slt as finetune
+import tools_infer_sonar_slt as infer
 
 
 class TinyVisualAdapter(nn.Module):
@@ -139,6 +140,17 @@ def test_kptextdataset_reshapes_flattened_keypoints(tmp_path: Path):
     # Confidence channel should match the original last channel after reshaping.
     original_conf = flat.reshape(frames, num_landmarks, 4)[..., -1]
     assert torch.allclose(keypoints[..., 2], torch.from_numpy(original_conf), atol=1e-6)
+
+
+def test_normalise_keypoints_confidence_matches_inference():
+    arr = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+    train_norm = finetune.normalise_keypoints(arr)
+    infer_norm = infer.normalise_keypoints(arr)
+
+    expected_conf = arr[..., -1]
+    np.testing.assert_allclose(train_norm[..., 2], expected_conf)
+    np.testing.assert_allclose(infer_norm[..., 2], expected_conf)
+    np.testing.assert_allclose(train_norm[..., 2], infer_norm[..., 2])
 
 
 def test_train_pipeline_generates_checkpoint(synthetic_training_setup: finetune.TrainConfig):
