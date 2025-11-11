@@ -10,6 +10,7 @@ Usage (Windows PowerShell example):
     --csv meta.csv \
     --adapter-ckpt runs/sonar_slt_finetune_lsa/checkpoints/adapter_final.pt \
     --out runs/sonar_slt_infer \
+    --video-dir data/single_signer/videos \
     --tgt-lang spa_Latn \
     --device auto
 
@@ -17,6 +18,8 @@ Notes
 -----
 - Expects (T, N, C) keypoints (MediaPipe Holistic by default) normalised as in training.
 - Provide the checkpoint containing `adapter` and `bridge` weights from the fine‑tuning script.
+- Multimodal checkpoints (those trained with ViT/VideoMAE weights) require paired RGB clips;
+  pass `--video-dir` (and optionally `--clip-frames` / `--frame-size`) to mirror training.
 - Uses the SONAR HF port `mtmlt/sonar-nllb-200-1.3B` by default (matching training).
 - Bridge checkpoints remain compatible; `load_bridge` infers the correct shape from saved weights.
 - Override the decoder with `--sonar-model-dir /path/or/repo` if you have a local copy.
@@ -48,6 +51,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tools_keypoint_utils import extract_confidence_channel
+
+try:  # pragma: no cover - optional dependency for multimodal checkpoints
+    import cv2
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency
+    from slt.utils.visual_adapter import VisualFusionAdapter
+except Exception:  # pragma: no cover - keep inference usable without visual extras
+    VisualFusionAdapter = None  # type: ignore[assignment]
 
 try:
     from transformers import (
@@ -87,6 +100,50 @@ else:
 KEYPOINT_CHANNELS = 3  # (x, y, conf)
 DEFAULT_SONAR_MODEL_NAME = "mtmlt/sonar-nllb-200-1.3B"
 DEFAULT_TGT_LANG = "spa_Latn"
+DEFAULT_CLIP_FRAMES = 16
+DEFAULT_FRAME_SIZE = 224
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
+
+
+def _coerce_path(value: Optional[Any]) -> Optional[Path]:
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        return Path(cleaned)
+    return None
+
+
+def _maybe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def adapter_requires_video(state: Dict[str, Any]) -> bool:
+    for key in state.keys():
+        if isinstance(key, str) and (key.startswith("vit.") or key.startswith("videomae.")):
+            return True
+    return False
 
 
 def reshape_flat_keypoints(
@@ -441,9 +498,15 @@ class SonarDecoder:
 # End‑to‑end model
 # -----------------------------
 class SonarSLTInference(nn.Module):
-    def __init__(self, num_landmarks: int):
+    def __init__(self, fusion_adapter: nn.Module, *, expects_frames: bool) -> None:
         super().__init__()
-        self.fusion_adapter = FusionAdapter(AdapterConfig(), num_landmarks)
+        self.fusion_adapter = fusion_adapter
+        self.expects_frames = expects_frames
+
+    def _adapter_param_dtype(self) -> torch.dtype:
+        for param in self.fusion_adapter.parameters():
+            return param.dtype
+        return torch.float32
 
     def load_adapter(self, adapter_state: Dict[str, torch.Tensor]) -> None:
         if not isinstance(adapter_state, dict):
@@ -467,10 +530,11 @@ class SonarSLTInference(nn.Module):
 
         keypoint_bias_value: Optional[torch.Tensor] = None
 
-        has_kp_proj = any(key.startswith("kp_proj.") for key in state_dict)
+        has_kp_proj_attr = hasattr(self.fusion_adapter, "kp_proj")
+        has_kp_proj = has_kp_proj_attr and any(key.startswith("kp_proj.") for key in state_dict)
         has_fusion_key_proj = any(key.startswith("fusion.key_proj.") for key in state_dict)
 
-        if not has_kp_proj and has_fusion_key_proj:
+        if has_kp_proj_attr and not has_kp_proj and has_fusion_key_proj:
             converted_state: Dict[str, torch.Tensor] = {}
             drop_prefixes = (
                 "fusion.key_proj.",
@@ -515,7 +579,7 @@ class SonarSLTInference(nn.Module):
             else:
                 filtered_out.append(key)
 
-        if keypoint_bias_value is not None:
+        if keypoint_bias_value is not None and "keypoint_bias" in expected_keys:
             filtered_state["keypoint_bias"] = keypoint_bias_value
 
         if filtered_out:
@@ -548,10 +612,26 @@ class SonarSLTInference(nn.Module):
             )
 
     @torch.no_grad()
-    def forward(self, keypoints_btnc: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        keypoints_btnc: torch.Tensor,
+        frames_btnchw: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if keypoints_btnc.ndim != 4:
             raise ValueError(f"Expected keypoints (B,T,N,C), got {keypoints_btnc.shape}")
-        kp = keypoints_btnc.to(self.fusion_adapter.kp_proj.weight.dtype)
+        dtype = self._adapter_param_dtype()
+        kp = keypoints_btnc.to(dtype)
+        frames: Optional[torch.Tensor] = None
+        if frames_btnchw is not None:
+            if frames_btnchw.ndim != 5:
+                raise ValueError(
+                    f"Expected frames shaped (B,T,C,H,W), got {frames_btnchw.shape}"
+                )
+            frames = frames_btnchw.to(dtype)
+        if self.expects_frames:
+            if frames is None:
+                raise ValueError("Multimodal adapter requires frames tensor during inference")
+            return self.fusion_adapter(kp, frames)
         return self.fusion_adapter(kp)
 
 
@@ -563,6 +643,87 @@ class Clip:
     clip_id: str
     keypoints_path: Path
     video_name: Optional[str] = None
+    video_path: Optional[Path] = None
+
+
+def _normalise_candidate(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+class VideoClipLoader:
+    def __init__(self, video_dir: Path, *, clip_frames: int, frame_size: int) -> None:
+        if clip_frames <= 0:
+            raise ValueError("clip_frames must be positive")
+        if frame_size <= 0:
+            raise ValueError("frame_size must be positive")
+        if cv2 is None:
+            raise RuntimeError(
+                "OpenCV (cv2) is required to load videos for multimodal checkpoints."
+            )
+        self.video_dir = video_dir
+        self.clip_frames = int(clip_frames)
+        self.frame_size = int(frame_size)
+
+    def resolve(self, clip: Clip) -> Optional[Path]:
+        candidates: List[str] = []
+
+        def push(raw: Optional[str]) -> None:
+            value = _normalise_candidate(raw)
+            if value is None:
+                return
+            if value not in candidates:
+                candidates.append(value)
+
+        push(clip.video_name)
+        push(clip.clip_id)
+        if clip.video_name:
+            raw_path = Path(clip.video_name)
+            if raw_path.suffix:
+                push(raw_path.stem)
+                push(raw_path.stem.lower())
+        push(clip.clip_id.lower())
+
+        for name in candidates:
+            literal = self.video_dir / name
+            if literal.exists():
+                return literal
+            path_name = Path(name)
+            if path_name.suffix:
+                continue
+            for ext in VIDEO_EXTENSIONS:
+                candidate = self.video_dir / f"{name}{ext}"
+                if candidate.exists():
+                    return candidate
+        return None
+
+    def load(self, clip: Clip) -> np.ndarray:
+        path = self.resolve(clip)
+        if path is None:
+            raise FileNotFoundError(
+                f"Video not found for id={clip.clip_id} in {self.video_dir}"
+            )
+        clip.video_path = path
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():  # pragma: no cover - depends on codec support
+            raise RuntimeError(f"Unable to open video: {path}")
+        frames: List[np.ndarray] = []
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (self.frame_size, self.frame_size))
+            frames.append(frame.astype(np.float32) / 255.0)
+        capture.release()
+        if not frames:
+            raise RuntimeError(f"Video {path} did not contain readable frames")
+        arr = np.stack(frames, axis=0)  # (T, H, W, C)
+        arr = arr.transpose(0, 3, 1, 2)  # (T, C, H, W)
+        arr = pad_or_sample(arr, self.clip_frames, axis=0)
+        return arr
 
 
 def load_meta(csv_path: Path) -> List[Dict[str, str]]:
@@ -638,6 +799,15 @@ def main():
         ),
     )
     ap.add_argument(
+        "--video-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory with RGB clips when using multimodal checkpoints (ViT/VideoMAE)."
+            " Frames are resized to --frame-size and sampled/padded to --clip-frames."
+        ),
+    )
+    ap.add_argument(
         "--adapter-ckpt",
         type=Path,
         required=True,
@@ -655,6 +825,18 @@ def main():
         ),
     )
     ap.add_argument("--T", type=int, default=128, help="Temporal length for keypoints")
+    ap.add_argument(
+        "--clip-frames",
+        type=int,
+        default=DEFAULT_CLIP_FRAMES,
+        help="Number of RGB frames per clip provided to the visual backbones",
+    )
+    ap.add_argument(
+        "--frame-size",
+        type=int,
+        default=DEFAULT_FRAME_SIZE,
+        help="Square spatial resolution (pixels) applied when resizing video frames",
+    )
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--num-beams", type=int, default=4)
@@ -719,6 +901,9 @@ def main():
     cli_args = sys.argv[1:]
     tgt_lang_from_cli = any(arg.startswith("--tgt-lang") for arg in cli_args)
     sonar_model_from_cli = any(arg.startswith("--sonar-model-dir") for arg in cli_args)
+    video_dir_from_cli = any(arg.startswith("--video-dir") for arg in cli_args)
+    clip_frames_from_cli = any(arg.startswith("--clip-frames") for arg in cli_args)
+    frame_size_from_cli = any(arg.startswith("--frame-size") for arg in cli_args)
 
     device = _resolve_device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -755,6 +940,31 @@ def main():
     else:
         raise TypeError("Checkpoint key 'config' must be a mapping when present")
 
+    config_video_dir = _coerce_path(config.get("video_dir"))
+    if not video_dir_from_cli and config_video_dir is not None:
+        args.video_dir = config_video_dir
+        LOGGER.info("Using video directory '%s' from checkpoint config.", args.video_dir)
+    elif video_dir_from_cli and args.video_dir is not None and config_video_dir is not None:
+        if args.video_dir != config_video_dir:
+            LOGGER.warning(
+                "CLI video directory '%s' differs from training path '%s'; proceeding with user override.",
+                args.video_dir,
+                config_video_dir,
+            )
+
+    config_clip_frames = _maybe_int(config.get("clip_frames"))
+    if config_clip_frames is not None and not clip_frames_from_cli:
+        args.clip_frames = config_clip_frames
+        LOGGER.info("Using clip_frames=%d from checkpoint config.", args.clip_frames)
+
+    config_frame_size = _maybe_int(config.get("frame_size"))
+    if config_frame_size is not None and not frame_size_from_cli:
+        args.frame_size = config_frame_size
+        LOGGER.info("Using frame_size=%d from checkpoint config.", args.frame_size)
+
+    if args.video_dir is not None:
+        args.video_dir = Path(args.video_dir).expanduser()
+
     required_keys = {"adapter", "bridge", "num_landmarks"}
     missing_keys = [key for key in required_keys if key not in ckpt]
     if missing_keys:
@@ -765,6 +975,8 @@ def main():
     bridge_state = ckpt["bridge"]
     if not isinstance(adapter_state, dict) or not isinstance(bridge_state, dict):
         raise TypeError("Checkpoint keys 'adapter' and 'bridge' must be state dicts")
+
+    uses_video = adapter_requires_video(adapter_state)
 
     lora_state = ckpt.get("lora")
     lora_config_dict = ckpt.get("lora_config")
@@ -883,8 +1095,66 @@ def main():
         raise ValueError("Checkpoint missing a valid 'num_landmarks'")
     d_model = ckpt.get("d_model")
 
+    adapter_config = AdapterConfig()
+    if uses_video:
+        if VisualFusionAdapter is None:
+            raise RuntimeError(
+                "Checkpoint includes ViT/VideoMAE weights but VisualFusionAdapter dependencies are missing."
+                " Install the project with visual extras to enable multimodal inference."
+            )
+        if args.video_dir is None:
+            raise RuntimeError(
+                "Checkpoint includes ViT/VideoMAE weights; please provide paired videos via --video-dir."
+            )
+        if not args.video_dir.exists():
+            raise FileNotFoundError(
+                f"Video directory not found: {args.video_dir}"
+            )
+
+        vit_model_name = config.get("vit_model")
+        if not isinstance(vit_model_name, str) or not vit_model_name.strip():
+            vit_model_name = "vit_base_patch16_224"
+        else:
+            vit_model_name = vit_model_name.strip()
+
+        videomae_model_name = config.get("videomae_model")
+        if not isinstance(videomae_model_name, str) or not videomae_model_name.strip():
+            videomae_model_name = "MCG-NJU/videomae-base"
+        else:
+            videomae_model_name = videomae_model_name.strip()
+
+        vit_checkpoint = _coerce_path(config.get("vit_checkpoint"))
+        videomae_checkpoint = _coerce_path(config.get("videomae_checkpoint"))
+        freeze_vit = _maybe_bool(config.get("freeze_vit"))
+        freeze_videomae = _maybe_bool(config.get("freeze_videomae"))
+        freeze_keypoint = _maybe_bool(config.get("freeze_keypoint"))
+
+        adapter_module = VisualFusionAdapter(
+            adapter_config,
+            num_points=num_landmarks,
+            vit_name=vit_model_name,
+            vit_checkpoint=vit_checkpoint,
+            freeze_vit=bool(freeze_vit),
+            videomae_name=videomae_model_name,
+            videomae_checkpoint=videomae_checkpoint,
+            freeze_videomae=bool(freeze_videomae),
+            freeze_keypoint=bool(freeze_keypoint),
+        ).to(device)
+        video_loader = VideoClipLoader(
+            args.video_dir,
+            clip_frames=args.clip_frames,
+            frame_size=args.frame_size,
+        )
+    else:
+        if args.video_dir is not None:
+            LOGGER.info(
+                "Ignoring --video-dir because checkpoint does not contain visual backbone weights."
+            )
+        adapter_module = FusionAdapter(adapter_config, num_landmarks).to(device)
+        video_loader = None
+
     # Build adapter model
-    model = SonarSLTInference(num_landmarks=num_landmarks).to(device)
+    model = SonarSLTInference(adapter_module, expects_frames=uses_video).to(device)
     model.load_adapter(adapter_state)
     if args.half and device.type == "cuda":
         model.half()
@@ -964,8 +1234,33 @@ def main():
                 "conf": {"min": conf_min, "max": conf_max, "std": conf_std},
             }
 
+            frames_tensor: Optional[torch.Tensor] = None
+            frames_stats: Optional[Dict[str, float]] = None
+            video_path_str: Optional[str] = None
+            if video_loader is not None:
+                frames_np = video_loader.load(clip)
+                video_path_str = str(clip.video_path) if clip.video_path is not None else None
+                frames_min = float(frames_np.min())
+                frames_max = float(frames_np.max())
+                frames_std = float(frames_np.std())
+                LOGGER.info(
+                    "[%s] video frames min=%.4f max=%.4f std=%.4f (shape=%s)",
+                    clip.clip_id,
+                    frames_min,
+                    frames_max,
+                    frames_std,
+                    tuple(frames_np.shape),
+                )
+                frames_stats = {"min": frames_min, "max": frames_max, "std": frames_std}
+                frames_tensor = torch.from_numpy(frames_np).unsqueeze(0)
+                if args.half and device.type == "cuda":
+                    frames_tensor = frames_tensor.half()
+                else:
+                    frames_tensor = frames_tensor.float()
+                frames_tensor = frames_tensor.to(device)
+
             with torch.inference_mode():
-                z = model(kp_t)  # [1,1024]
+                z = model(kp_t, frames_tensor)  # [1,1024]
 
             z = z.to(decoder.bridge.weight.device)
             z = z.to(decoder.bridge.weight.dtype)
@@ -997,10 +1292,12 @@ def main():
                 "id": clip.clip_id,
                 "video": video_name,
                 "keypoints": str(clip.keypoints_path),
+                "video_path": video_path_str,
                 "lang": args.tgt_lang,
                 "text": text,
                 "kp_stats": kp_stats,
                 "z_stats": z_stats,
+                "video_stats": frames_stats,
             }, ensure_ascii=False) + "\n")
             fh_log.flush()
             print(f"[ok] {clip.clip_id} → {text}")
