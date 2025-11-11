@@ -73,7 +73,7 @@ def sonar_checkpoint(tmp_path: Path, hf_sonar_dir: Path) -> Path:
         "bridge": bridge_state,
         "num_landmarks": 3,
         "d_model": d_model,
-        "config": {"model_name": str(hf_sonar_dir)},
+        "config": {"model_name": str(hf_sonar_dir), "T": 42},
     }
     ckpt_path = tmp_path / "adapter.pt"
     torch.save(ckpt, ckpt_path)
@@ -168,6 +168,59 @@ def test_inference_pipeline_runs(tmp_path: Path, sonar_checkpoint: Path, hf_sona
         records = [json.loads(line) for line in fh if line.strip()]
     assert records
 
+
+def test_temporal_length_inherits_from_checkpoint(
+    tmp_path: Path,
+    sonar_checkpoint: Path,
+    hf_sonar_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keypoints_dir = tmp_path / "kp_inherit"
+    keypoints_dir.mkdir()
+
+    rng = np.random.default_rng(123)
+    keypoints = rng.normal(size=(5, 3, infer.KEYPOINT_CHANNELS)).astype(np.float32)
+    np.save(keypoints_dir / "clip01.npy", keypoints)
+
+    meta_csv = tmp_path / "meta.csv"
+    _write_meta_csv(meta_csv, [{"id": "clip01", "text": "placeholder"}])
+
+    out_dir = tmp_path / "out_inherit"
+
+    original_pad_or_sample = infer.pad_or_sample
+    seen_targets: list[int] = []
+
+    def _tracking_pad_or_sample(array: np.ndarray, target_frames: int, axis: int = 0) -> np.ndarray:
+        seen_targets.append(target_frames)
+        return original_pad_or_sample(array, target_frames, axis=axis)
+
+    monkeypatch.setattr(infer, "pad_or_sample", _tracking_pad_or_sample)
+
+    args = [
+        "tools_infer_sonar_slt.py",
+        "--keypoints-dir",
+        str(keypoints_dir),
+        "--adapter-ckpt",
+        str(sonar_checkpoint),
+        "--csv",
+        str(meta_csv),
+        "--out",
+        str(out_dir),
+        "--sonar-model-dir",
+        str(hf_sonar_dir),
+        "--tgt-lang",
+        "en_XX",
+        "--num-beams",
+        "1",
+        "--max-new-tokens",
+        "4",
+    ]
+    monkeypatch.setenv("TRANSFORMERS_CACHE", str((tmp_path / "hf_cache").resolve()))
+    monkeypatch.setattr(sys, "argv", args)
+
+    infer.main()
+
+    assert 42 in seen_targets
 
 def test_resolve_clips_supports_ids_with_extension(tmp_path: Path) -> None:
     keypoints_dir = tmp_path / "kp"

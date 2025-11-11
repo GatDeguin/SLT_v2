@@ -909,6 +909,7 @@ def main():
     sonar_model_from_cli = any(arg.startswith("--sonar-model-dir") for arg in cli_args)
     video_dir_from_cli = any(arg.startswith("--video-dir") for arg in cli_args)
     clip_frames_from_cli = any(arg.startswith("--clip-frames") for arg in cli_args)
+    T_from_cli = any(arg == "--T" or arg.startswith("--T=") for arg in cli_args)
     frame_size_from_cli = any(arg.startswith("--frame-size") for arg in cli_args)
 
     device = _resolve_device(args.device)
@@ -967,6 +968,11 @@ def main():
     if config_frame_size is not None and not frame_size_from_cli:
         args.frame_size = config_frame_size
         LOGGER.info("Using frame_size=%d from checkpoint config.", args.frame_size)
+
+    config_T = _maybe_int(config.get("T"))
+    if config_T is not None and config_T > 0 and not T_from_cli:
+        args.T = config_T
+        LOGGER.info("Using T=%d from checkpoint config.", args.T)
 
     if args.video_dir is not None:
         args.video_dir = Path(args.video_dir).expanduser()
