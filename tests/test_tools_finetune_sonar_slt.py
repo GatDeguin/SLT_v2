@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import random
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -204,6 +206,34 @@ def test_pad_or_sample_behaviour(length: Iterable[int], target: int):
     arr = arr[:, None]
     adjusted = finetune.pad_or_sample(arr, target, axis=0)
     assert adjusted.shape[0] == target
+
+
+def test_pad_or_sample_random_window_sampling():
+    arr = np.arange(10, dtype=np.float32)[:, None]
+    rng = random.Random(0)
+    sampled = finetune.pad_or_sample(
+        arr,
+        4,
+        axis=0,
+        stochastic=True,
+        random_window=True,
+        rng=rng,
+    )
+    np.testing.assert_array_equal(sampled[:, 0], np.array([6, 7, 8, 9], dtype=np.float32))
+
+
+def test_pad_or_sample_frame_jitter_sampling():
+    arr = np.arange(10, dtype=np.float32)[:, None]
+    rng = random.Random(0)
+    sampled = finetune.pad_or_sample(
+        arr,
+        4,
+        axis=0,
+        stochastic=True,
+        frame_jitter=True,
+        rng=rng,
+    )
+    np.testing.assert_array_equal(sampled[:, 0], np.array([2, 5, 8, 8], dtype=np.float32))
 
 
 class DummyCV2:

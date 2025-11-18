@@ -257,13 +257,46 @@ def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     return np.concatenate([normalised, conf], axis=-1)
 
 
-def pad_or_sample(array: np.ndarray, target_frames: int, axis: int = 0) -> np.ndarray:
+def pad_or_sample(
+    array: np.ndarray,
+    target_frames: int,
+    axis: int = 0,
+    *,
+    stochastic: bool = False,
+    random_window: bool = False,
+    frame_jitter: bool = False,
+    rng: Optional[random.Random] = None,
+) -> np.ndarray:
+    """Pad or sample ``array`` along ``axis`` to ``target_frames``.
+
+    When ``stochastic`` is enabled and the sequence is longer than ``target_frames``,
+    either draw a random contiguous window (``random_window``) or jitter the evenly
+    spaced sampling grid (``frame_jitter``). This ensures every frame remains
+    reachable across epochs while keeping deterministic behaviour when
+    ``stochastic`` is disabled (evaluation/inference).
+    """
+
     length = array.shape[axis]
     if length == target_frames:
         return array
     if length == 0:
         raise ValueError("Cannot pad/sample an empty keypoint sequence")
     if length > target_frames:
+        rng_impl: Optional[random.Random]
+        rng_impl = rng if rng is not None else random  # type: ignore[assignment]
+        use_random = bool(stochastic)
+        if use_random and random_window:
+            max_start = max(length - target_frames, 0)
+            start = rng_impl.randint(0, max_start) if max_start > 0 else 0
+            idxs = np.arange(start, start + target_frames, dtype=int)
+            return np.take(array, idxs, axis=axis)
+        if use_random and frame_jitter:
+            fractions = np.linspace(0.0, 1.0, num=target_frames, endpoint=True, dtype=np.float64)
+            phase = rng_impl.random()
+            fractions = (fractions + phase) % 1.0
+            fractions.sort()
+            idxs = np.rint(fractions * (length - 1)).astype(int)
+            return np.take(array, idxs, axis=axis)
         idxs = np.linspace(0, length - 1, num=target_frames)
         idxs = np.rint(idxs).astype(int)
         return np.take(array, idxs, axis=axis)
@@ -320,6 +353,8 @@ class KPTextDataset(Dataset):
         video_dir: Optional[Path] = None,
         clip_frames: int = DEFAULT_CLIP_FRAMES,
         frame_size: int = DEFAULT_IMG_SIZE,
+        random_frame_sampling: bool = False,
+        frame_jitter: bool = False,
     ) -> None:
         self.keypoints_dir = keypoints_dir
         self.video_dir = video_dir
@@ -331,6 +366,9 @@ class KPTextDataset(Dataset):
         self.T = int(T)
         self.clip_frames = int(clip_frames)
         self.frame_size = int(frame_size)
+        self.random_frame_sampling = bool(random_frame_sampling)
+        self.frame_jitter = bool(frame_jitter)
+        self._rng = random.Random()
 
     def __len__(self) -> int:
         return len(self.items)
@@ -363,7 +401,16 @@ class KPTextDataset(Dataset):
             keypoints, num_landmarks=0, expected_channels=KEYPOINT_CHANNELS
         )
         keypoints = normalise_keypoints(keypoints)
-        keypoints = pad_or_sample(keypoints, self.T, axis=0)
+        stochastic_sampling = self.random_frame_sampling or self.frame_jitter
+        keypoints = pad_or_sample(
+            keypoints,
+            self.T,
+            axis=0,
+            stochastic=stochastic_sampling,
+            random_window=self.random_frame_sampling,
+            frame_jitter=self.frame_jitter,
+            rng=self._rng,
+        )
         video_tensor: Optional[torch.Tensor] = None
         if self.video_dir is not None:
             video_path = self._resolve_video_path(row.vid)
@@ -372,7 +419,15 @@ class KPTextDataset(Dataset):
                     f"Video not found for id={row.vid} in {self.video_dir}"
                 )
             video_np = self._load_video(video_path)
-            video_np = pad_or_sample(video_np, self.clip_frames, axis=0)
+            video_np = pad_or_sample(
+                video_np,
+                self.clip_frames,
+                axis=0,
+                stochastic=stochastic_sampling,
+                random_window=self.random_frame_sampling,
+                frame_jitter=self.frame_jitter,
+                rng=self._rng,
+            )
             video_tensor = torch.from_numpy(video_np).to(torch.float32)
         return {
             "id": row.vid,
@@ -854,6 +909,8 @@ class TrainConfig:
     T: int = DEFAULT_T
     clip_frames: int = DEFAULT_CLIP_FRAMES
     frame_size: int = DEFAULT_IMG_SIZE
+    random_frame_sampling: bool = False
+    frame_jitter: bool = False
     batch_size: int = 8
     accum: int = 2
     epochs: int = 10
@@ -1241,6 +1298,8 @@ def train(cfg: TrainConfig) -> None:
         video_dir=cfg.video_dir,
         clip_frames=cfg.clip_frames,
         frame_size=cfg.frame_size,
+        random_frame_sampling=cfg.random_frame_sampling,
+        frame_jitter=cfg.frame_jitter,
     )
     dev_ds: Optional[KPTextDataset] = None
     if cfg.dev_csv is not None:
@@ -1816,6 +1875,24 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--T", type=int, default=DEFAULT_T)
     ap.add_argument("--clip-frames", type=int, default=DEFAULT_CLIP_FRAMES)
     ap.add_argument("--frame-size", type=int, default=DEFAULT_IMG_SIZE)
+    ap.add_argument(
+        "--random-frame-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable stochastic contiguous crops when sequences exceed T/clip frames."
+            " Disable via --no-random-frame-sampling."
+        ),
+    )
+    ap.add_argument(
+        "--frame-jitter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply randomised linspace phase when downsampling long sequences."
+            " Disable via --no-frame-jitter."
+        ),
+    )
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=10)
@@ -1961,6 +2038,8 @@ def parse_args() -> TrainConfig:
         T=args.T,
         clip_frames=args.clip_frames,
         frame_size=args.frame_size,
+        random_frame_sampling=args.random_frame_sampling,
+        frame_jitter=args.frame_jitter,
         batch_size=args.batch_size,
         accum=args.accum,
         epochs=args.epochs,
