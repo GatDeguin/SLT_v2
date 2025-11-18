@@ -744,6 +744,7 @@ class TrainConfig:
     keypoints_dir: Path
     csv: Path
     out_dir: Path
+    dev_csv: Optional[Path] = None
     video_dir: Optional[Path] = None
     model_name: str = "mtmlt/sonar-nllb-200-1.3B"
     tgt_lang: str = "spa_Latn"
@@ -761,6 +762,7 @@ class TrainConfig:
     half: bool = False
     save_every: int = 500
     log_every: int = 50
+    eval_every: int = 500
     mse_weight: float = 7000.0   # λ_mse inside L_sem (paper impl. details)
     cos_weight: float = 2.7      # λ_cos inside L_sem
     lam_sem: float = 1.0         # λ_sem
@@ -888,6 +890,142 @@ def _generate_sample_prediction(
             module.train(was_training)
 
 
+def _compute_batch_losses(
+    *,
+    cfg: TrainConfig,
+    adapter: nn.Module,
+    bridge: nn.Module,
+    decoder: nn.Module,
+    text_pool: TextPooler,
+    tokenizer,
+    device: torch.device,
+    texts: Sequence[str],
+    keypoints: torch.Tensor,
+    frames_tensor: Optional[torch.Tensor],
+    nce_queue: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+    """Run a forward pass and return the weighted loss + metrics."""
+
+    with torch.amp.autocast("cuda", enabled=cfg.half and device.type == "cuda"):
+        z = adapter(keypoints, frames_tensor)  # [B,1024]
+        mem_z = bridge(z).unsqueeze(1)  # [B,1,d_model]
+
+        s = text_pool.encode(texts).to(mem_z.dtype)
+        with torch.no_grad():
+            W = bridge.weight  # [d_model,1024]
+            W_f32 = W.to(torch.float32)
+            W_pinv_fp32 = torch.linalg.pinv(W_f32, rcond=1e-5)
+        s_fp32 = s.to(torch.float32)
+        s_1024_fp32 = torch.matmul(s_fp32, W_pinv_fp32.T).contiguous()
+        s_1024 = s_1024_fp32.to(z.dtype)
+
+        mse = F.mse_loss(z, s_1024)
+        cos = 1.0 - F.cosine_similarity(z, s_1024, dim=-1).mean()
+        L_sem = cfg.mse_weight * mse + cfg.cos_weight * cos
+
+        tokenizer.src_lang = cfg.tgt_lang
+        batch = tokenizer(texts, return_tensors="pt", padding=True).to(device)
+        labels = batch["input_ids"].clone()
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+        enc_out_z = BaseModelOutput(last_hidden_state=mem_z)
+        out_z = decoder(encoder_outputs=enc_out_z, labels=labels)
+        L_ce = out_z.loss
+
+        mem_s = s.unsqueeze(1)
+        enc_out_s = BaseModelOutput(last_hidden_state=mem_s)
+        out_s = decoder(encoder_outputs=enc_out_s, labels=labels)
+        L_ae = out_s.loss
+
+        L_nce = torch.zeros((), device=z.device, dtype=z.dtype)
+        s_norm: Optional[torch.Tensor] = None
+        if cfg.lam_nce > 0:
+            z_norm = F.normalize(z.to(torch.float32), dim=-1)
+            s_norm = F.normalize(s_1024_fp32, dim=-1)
+            negatives = [s_norm]
+            if nce_queue is not None and nce_queue.numel() > 0:
+                negatives.append(nce_queue)
+            all_targets = torch.cat(negatives, dim=0)
+            logits = torch.matmul(z_norm, all_targets.t()) / max(cfg.nce_temperature, 1e-6)
+            labels_nce = torch.arange(z_norm.size(0), device=z.device)
+            L_nce = F.cross_entropy(logits, labels_nce).to(z.dtype)
+
+        loss = (
+            cfg.lam_sem * L_sem
+            + cfg.lam_ce * L_ce
+            + cfg.lam_ae * L_ae
+            + cfg.lam_nce * L_nce
+        )
+
+    metrics = {
+        "loss": loss,
+        "L_sem": L_sem,
+        "mse": mse,
+        "cos": cos,
+        "L_ce": L_ce,
+        "L_ae": L_ae,
+        "L_nce": L_nce,
+    }
+    return loss, metrics, s_norm
+
+
+def _evaluate_on_loader(
+    dev_dl: DataLoader,
+    *,
+    cfg: TrainConfig,
+    adapter: nn.Module,
+    bridge: nn.Module,
+    decoder: nn.Module,
+    text_pool: TextPooler,
+    tokenizer,
+    device: torch.device,
+) -> Optional[Dict[str, float]]:
+    """Compute average losses over ``dev_dl`` using eval mode."""
+
+    if dev_dl is None:
+        return None
+
+    modules: List[nn.Module] = [adapter, bridge, decoder]
+    prev_states = [module.training for module in modules]
+    for module in modules:
+        module.eval()
+
+    try:
+        totals: Dict[str, float] = {}
+        num_batches = 0
+        with torch.no_grad():
+            for _ids, texts, kp, video in dev_dl:
+                kp = kp.to(device)
+                frames_tensor: Optional[torch.Tensor] = None
+                if video is not None:
+                    frames_tensor = video.to(device)
+                _, metrics, _ = _compute_batch_losses(
+                    cfg=cfg,
+                    adapter=adapter,
+                    bridge=bridge,
+                    decoder=decoder,
+                    text_pool=text_pool,
+                    tokenizer=tokenizer,
+                    device=device,
+                    texts=texts,
+                    keypoints=kp,
+                    frames_tensor=frames_tensor,
+                    nce_queue=None,
+                )
+                for key, value in metrics.items():
+                    totals[key] = totals.get(key, 0.0) + float(value.detach().cpu())
+                num_batches += 1
+
+        if num_batches == 0:
+            return None
+
+        return {key: total / num_batches for key, total in totals.items()}
+    finally:
+        for module, was_training in zip(modules, prev_states):
+            module.train(was_training)
+
+
 def train(cfg: TrainConfig) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     (cfg.out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -910,6 +1048,17 @@ def train(cfg: TrainConfig) -> None:
         clip_frames=cfg.clip_frames,
         frame_size=cfg.frame_size,
     )
+    dev_ds: Optional[KPTextDataset] = None
+    if cfg.dev_csv is not None:
+        dev_ds = KPTextDataset(
+            cfg.keypoints_dir,
+            cfg.dev_csv,
+            T=cfg.T,
+            video_dir=cfg.video_dir,
+            clip_frames=cfg.clip_frames,
+            frame_size=cfg.frame_size,
+            shuffle=False,
+        )
     N = count_landmarks(ds[0]["keypoints"])  # landmarks
 
     # Model pieces
@@ -989,6 +1138,16 @@ def train(cfg: TrainConfig) -> None:
         collate_fn=collate,
         pin_memory=(device.type == "cuda"),
     )
+    dev_dl: Optional[DataLoader] = None
+    if dev_ds is not None:
+        dev_dl = DataLoader(
+            dev_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate,
+            pin_memory=(device.type == "cuda"),
+        )
 
     layout: Dict[str, List[int]] = {}
     connections: Dict[str, List[Tuple[int, int]]] = {}
@@ -1005,6 +1164,7 @@ def train(cfg: TrainConfig) -> None:
 
     step = 0
     log_path = cfg.out_dir / "train_log.jsonl"
+    dev_log_path = cfg.out_dir / "dev_log.jsonl"
     accum_counter = 0
     nce_queue: Optional[torch.Tensor] = None
     nce_queue_max = 4096
@@ -1019,67 +1179,19 @@ def train(cfg: TrainConfig) -> None:
                 frames_tensor = video.to(device)
             kp = jitter_keypoints(kp, noise_std=0.04, drop_prob=0.2)
 
-            with torch.amp.autocast("cuda", enabled=cfg.half and device.type == "cuda"):
-                # --- Visual → semantic vector z (Eq. 1–3)
-                z = adapter(kp, frames_tensor)                # [B,1024]
-                mem_z = bridge(z).unsqueeze(1) # [B,1,d_model]
-
-                # --- Text → sentence embedding s (Eq. 4 + SONAR pooling)
-                s = text_pool.encode(texts).to(mem_z.dtype)  # [B,d_model]
-                # Project to adapter space for L_sem
-                # bring s to 1024 dim via inverse bridge (least‑squares via pseudo‑inverse)
-                with torch.no_grad():
-                    # Compute W^+ (pseudo‑inverse) once per step (small d_model); cache if needed
-                    W = bridge.weight  # [d_model,1024]
-                    W_f32 = W.to(torch.float32)
-                    W_pinv_fp32 = torch.linalg.pinv(W_f32, rcond=1e-5)
-                s_fp32 = s.to(torch.float32)
-                s_1024_fp32 = torch.matmul(s_fp32, W_pinv_fp32.T).contiguous()
-                s_1024 = s_1024_fp32.to(z.dtype)  # [B,1024]
-
-                # --- Losses
-                # L_sem = α * MSE(z, s_1024) + β * (1 - cos(z, s_1024))
-                mse = F.mse_loss(z, s_1024)
-                cos = 1.0 - F.cosine_similarity(z, s_1024, dim=-1).mean()
-                L_sem = cfg.mse_weight * mse + cfg.cos_weight * cos
-
-                # L_ce — teacher forcing on target Spanish from z
-                tok.src_lang = cfg.tgt_lang
-                batch = tok(texts, return_tensors="pt", padding=True).to(device)
-                labels = batch["input_ids"].clone()
-                pad_token_id = getattr(tok, "pad_token_id", None)
-                if pad_token_id is not None:
-                    labels[labels == pad_token_id] = -100
-                # In seq2seq HF, we pass encoder_outputs + labels
-                enc_out_z = BaseModelOutput(last_hidden_state=mem_z)
-                out_z = decoder(encoder_outputs=enc_out_z, labels=labels)
-                L_ce = out_z.loss
-
-                # L_ae — auto‑encoding from text embedding s
-                mem_s = s.unsqueeze(1)  # [B,1,d_model]
-                enc_out_s = BaseModelOutput(last_hidden_state=mem_s)
-                out_s = decoder(encoder_outputs=enc_out_s, labels=labels)
-                L_ae = out_s.loss
-
-                L_nce = torch.zeros((), device=z.device, dtype=z.dtype)
-                s_norm: Optional[torch.Tensor] = None
-                if cfg.lam_nce > 0:
-                    z_norm = F.normalize(z.to(torch.float32), dim=-1)
-                    s_norm = F.normalize(s_1024_fp32, dim=-1)
-                    negatives = [s_norm]
-                    if nce_queue is not None and nce_queue.numel() > 0:
-                        negatives.append(nce_queue)
-                    all_targets = torch.cat(negatives, dim=0)
-                    logits = torch.matmul(z_norm, all_targets.t()) / max(cfg.nce_temperature, 1e-6)
-                    labels_nce = torch.arange(z_norm.size(0), device=z.device)
-                    L_nce = F.cross_entropy(logits, labels_nce).to(z.dtype)
-
-                loss = (
-                    cfg.lam_sem * L_sem
-                    + cfg.lam_ce * L_ce
-                    + cfg.lam_ae * L_ae
-                    + cfg.lam_nce * L_nce
-                )
+            loss, metrics, s_norm = _compute_batch_losses(
+                cfg=cfg,
+                adapter=adapter,
+                bridge=bridge,
+                decoder=decoder,
+                text_pool=text_pool,
+                tokenizer=tok,
+                device=device,
+                texts=texts,
+                keypoints=kp,
+                frames_tensor=frames_tensor,
+                nce_queue=nce_queue,
+            )
 
             batches_remaining_after_current = total_batches - (batch_idx + 1)
             effective_accum = min(cfg.accum, accum_counter + batches_remaining_after_current)
@@ -1108,15 +1220,10 @@ def train(cfg: TrainConfig) -> None:
 
             if step % cfg.log_every == 0:
                 rec = {
+                    "split": "train",
                     "step": step,
                     "epoch": epoch,
-                    "loss": float(loss.detach().cpu()),
-                    "L_sem": float(L_sem.detach().cpu()),
-                    "mse": float(mse.detach().cpu()),
-                    "cos": float(cos.detach().cpu()),
-                    "L_ce": float(L_ce.detach().cpu()),
-                    "L_ae": float(L_ae.detach().cpu()),
-                    "L_nce": float(L_nce.detach().cpu()),
+                    **{k: float(v.detach().cpu()) for k, v in metrics.items()},
                 }
                 with log_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1130,6 +1237,44 @@ def train(cfg: TrainConfig) -> None:
                         L_nce=rec["L_nce"],
                     )
                 )
+
+            if (
+                dev_dl is not None
+                and cfg.eval_every > 0
+                and step % cfg.eval_every == 0
+            ):
+                dev_metrics = _evaluate_on_loader(
+                    dev_dl,
+                    cfg=cfg,
+                    adapter=adapter,
+                    bridge=bridge,
+                    decoder=decoder,
+                    text_pool=text_pool,
+                    tokenizer=tok,
+                    device=device,
+                )
+                if dev_metrics is not None:
+                    rec_dev = {
+                        "split": "dev",
+                        "step": step,
+                        "epoch": epoch,
+                        **{k: float(v) for k, v in dev_metrics.items()},
+                    }
+                    payload = json.dumps(rec_dev, ensure_ascii=False) + "\n"
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(payload)
+                    with dev_log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(payload)
+                    print(
+                        "[dev  {step:6d}] loss={loss:.4f}  L_sem={L_sem:.4f}  L_ce={L_ce:.4f}  L_ae={L_ae:.4f}  L_nce={L_nce:.4f}".format(
+                            step=step,
+                            loss=rec_dev["loss"],
+                            L_sem=rec_dev["L_sem"],
+                            L_ce=rec_dev["L_ce"],
+                            L_ae=rec_dev["L_ae"],
+                            L_nce=rec_dev["L_nce"],
+                        )
+                    )
 
             if step % cfg.save_every == 0:
                 ckpt = {
@@ -1335,6 +1480,12 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--keypoints-dir", type=Path, default=Path("single_signer/kp/keypoints"))
     ap.add_argument("--csv", type=Path, default=Path("meta_2.csv"))
     ap.add_argument("--out", type=Path, default=Path("runs/sonar_slt_finetune_lsa"))
+    ap.add_argument(
+        "--dev-csv",
+        type=Path,
+        default=None,
+        help="Optional held-out CSV with the same schema for validation",
+    )
     ap.add_argument("--video-dir", type=Path, default=None)
     ap.add_argument("--model-name", type=str, default="mtmlt/sonar-nllb-200-1.3B")
     ap.add_argument("--tgt-lang", type=str, default="spa_Latn")
@@ -1360,6 +1511,12 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument(
+        "--eval-every",
+        type=int,
+        default=500,
+        help="Evaluate on --dev-csv every N optimizer steps",
+    )
     ap.add_argument("--mse-weight", type=float, default=7000.0)
     ap.add_argument("--cos-weight", type=float, default=2.7)
     ap.add_argument("--lam-sem", type=float, default=1.0)
@@ -1422,6 +1579,7 @@ def parse_args() -> TrainConfig:
         keypoints_dir=args.keypoints_dir,
         csv=args.csv,
         out_dir=args.out,
+        dev_csv=args.dev_csv,
         video_dir=args.video_dir,
         model_name=args.model_name,
         tgt_lang=args.tgt_lang,
@@ -1439,6 +1597,7 @@ def parse_args() -> TrainConfig:
         half=bool(args.half),
         save_every=args.save_every,
         log_every=args.log_every,
+        eval_every=args.eval_every,
         mse_weight=args.mse_weight,
         cos_weight=args.cos_weight,
         lam_sem=args.lam_sem,
