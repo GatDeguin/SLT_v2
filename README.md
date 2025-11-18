@@ -64,6 +64,11 @@ Activate it by passing `--lam-nce` and tune the contrastive temperature with
 `--nce-temperature`. The implementation maintains a queue of recent sentence
 embeddings to provide additional negatives during training.
 
+⚠️ **Memory note:** The fine-tuning helper now loads a second, fully frozen
+SONAR decoder that serves as the teacher for `TextPooler`. This guarantees that
+LoRA updates only touch the student decoder but requires keeping two copies of
+the checkpoint in memory (roughly 2× the original SONAR footprint).
+
 ## Monitoring validation losses
 
 `tools_finetune_sonar_slt.py` now accepts a held-out metadata file via

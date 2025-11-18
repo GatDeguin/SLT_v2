@@ -200,3 +200,17 @@ class TextPooler:
     @property
     def bos_id(self) -> int:
         return self._bos_id
+
+    @property
+    def training(self) -> bool:
+        return bool(getattr(self._model, "training", False))
+
+    def train(self, mode: bool = True):
+        if hasattr(self._model, "train"):
+            self._model.train(mode)
+        return self
+
+    def eval(self):
+        if hasattr(self._model, "eval"):
+            self._model.eval()
+        return self
