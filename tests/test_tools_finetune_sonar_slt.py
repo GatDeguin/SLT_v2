@@ -174,6 +174,24 @@ def test_train_pipeline_generates_checkpoint(synthetic_training_setup: finetune.
     assert entries, "training log should record at least one step"
 
 
+def test_bridge_pinv_cache_matches_torch():
+    torch.manual_seed(0)
+    bridge = nn.Linear(4, 3, bias=False)
+    cache = finetune.BridgePinvCache(bridge)
+
+    cached_initial = cache.get()
+    expected_initial = torch.linalg.pinv(bridge.weight.detach().to(torch.float32), rcond=1e-5)
+    assert torch.allclose(cached_initial, expected_initial, atol=1e-6)
+
+    with torch.no_grad():
+        bridge.weight.add_(torch.randn_like(bridge.weight) * 0.01)
+    cache.mark_dirty()
+
+    cached_updated = cache.get()
+    expected_updated = torch.linalg.pinv(bridge.weight.detach().to(torch.float32), rcond=1e-5)
+    assert torch.allclose(cached_updated, expected_updated, atol=1e-6)
+
+
 @pytest.mark.parametrize(
     "length,target",
     [
