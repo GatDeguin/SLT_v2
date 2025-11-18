@@ -42,6 +42,7 @@ import csv
 import json
 import logging
 import os
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path, WindowsPath
@@ -222,13 +223,35 @@ def normalise_keypoints(arr: np.ndarray) -> np.ndarray:
     return np.concatenate([normalised, conf], axis=-1)
 
 
-def pad_or_sample(array: np.ndarray, target_frames: int, axis: int = 0) -> np.ndarray:
+def pad_or_sample(
+    array: np.ndarray,
+    target_frames: int,
+    axis: int = 0,
+    *,
+    stochastic: bool = False,
+    random_window: bool = False,
+    frame_jitter: bool = False,
+    rng: Optional[random.Random] = None,
+) -> np.ndarray:
     length = array.shape[axis]
     if length == target_frames:
         return array
     if length == 0:
         raise ValueError("Cannot pad/sample an empty keypoint sequence")
     if length > target_frames:
+        rng_impl = rng if rng is not None else random  # type: ignore[assignment]
+        if stochastic and random_window:
+            max_start = max(length - target_frames, 0)
+            start = rng_impl.randint(0, max_start) if max_start > 0 else 0
+            idxs = np.arange(start, start + target_frames, dtype=int)
+            return np.take(array, idxs, axis=axis)
+        if stochastic and frame_jitter:
+            fractions = np.linspace(0.0, 1.0, num=target_frames, endpoint=True, dtype=np.float64)
+            phase = rng_impl.random()
+            fractions = (fractions + phase) % 1.0
+            fractions.sort()
+            idxs = np.rint(fractions * (length - 1)).astype(int)
+            return np.take(array, idxs, axis=axis)
         idxs = np.linspace(0, length - 1, num=target_frames)
         idxs = np.rint(idxs).astype(int)
         return np.take(array, idxs, axis=axis)
@@ -579,7 +602,15 @@ def _normalise_candidate(value: Optional[str]) -> Optional[str]:
 
 
 class VideoClipLoader:
-    def __init__(self, video_dir: Path, *, clip_frames: int, frame_size: int) -> None:
+    def __init__(
+        self,
+        video_dir: Path,
+        *,
+        clip_frames: int,
+        frame_size: int,
+        random_frame_sampling: bool = False,
+        frame_jitter: bool = False,
+    ) -> None:
         if clip_frames <= 0:
             raise ValueError("clip_frames must be positive")
         if frame_size <= 0:
@@ -591,6 +622,9 @@ class VideoClipLoader:
         self.video_dir = video_dir
         self.clip_frames = int(clip_frames)
         self.frame_size = int(frame_size)
+        self.random_frame_sampling = bool(random_frame_sampling)
+        self.frame_jitter = bool(frame_jitter)
+        self._rng = random.Random()
 
     def resolve(self, clip: Clip) -> Optional[Path]:
         candidates: List[str] = []
@@ -647,7 +681,16 @@ class VideoClipLoader:
             raise RuntimeError(f"Video {path} did not contain readable frames")
         arr = np.stack(frames, axis=0)  # (T, H, W, C)
         arr = arr.transpose(0, 3, 1, 2)  # (T, C, H, W)
-        arr = pad_or_sample(arr, self.clip_frames, axis=0)
+        stochastic_sampling = self.random_frame_sampling or self.frame_jitter
+        arr = pad_or_sample(
+            arr,
+            self.clip_frames,
+            axis=0,
+            stochastic=stochastic_sampling,
+            random_window=self.random_frame_sampling,
+            frame_jitter=self.frame_jitter,
+            rng=self._rng,
+        )
         return arr
 
 
@@ -762,6 +805,24 @@ def main():
         default=DEFAULT_FRAME_SIZE,
         help="Square spatial resolution (pixels) applied when resizing video frames",
     )
+    ap.add_argument(
+        "--random-frame-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable stochastic contiguous crops when temporal length exceeds T/clip frames."
+            " Disable via --no-random-frame-sampling."
+        ),
+    )
+    ap.add_argument(
+        "--frame-jitter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply phase jitter to evenly-spaced sampling for long sequences."
+            " Disable via --no-frame-jitter."
+        ),
+    )
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--num-beams", type=int, default=4)
@@ -830,6 +891,15 @@ def main():
     clip_frames_from_cli = any(arg.startswith("--clip-frames") for arg in cli_args)
     T_from_cli = any(arg == "--T" or arg.startswith("--T=") for arg in cli_args)
     frame_size_from_cli = any(arg.startswith("--frame-size") for arg in cli_args)
+    random_sampling_from_cli = any(
+        arg.startswith("--random-frame-sampling")
+        or arg.startswith("--no-random-frame-sampling")
+        for arg in cli_args
+    )
+    frame_jitter_from_cli = any(
+        arg.startswith("--frame-jitter") or arg.startswith("--no-frame-jitter")
+        for arg in cli_args
+    )
 
     device = _resolve_device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -892,6 +962,22 @@ def main():
     if config_T is not None and config_T > 0 and not T_from_cli:
         args.T = config_T
         LOGGER.info("Using T=%d from checkpoint config.", args.T)
+
+    config_random_sampling = _maybe_bool(config.get("random_frame_sampling"))
+    if config_random_sampling is not None and not random_sampling_from_cli:
+        args.random_frame_sampling = bool(config_random_sampling)
+        LOGGER.info(
+            "Using random_frame_sampling=%s from checkpoint config.",
+            args.random_frame_sampling,
+        )
+
+    config_frame_jitter = _maybe_bool(config.get("frame_jitter"))
+    if config_frame_jitter is not None and not frame_jitter_from_cli:
+        args.frame_jitter = bool(config_frame_jitter)
+        LOGGER.info(
+            "Using frame_jitter=%s from checkpoint config.",
+            args.frame_jitter,
+        )
 
     config_multimodal = _maybe_bool(config.get("multimodal_adapter"))
 
@@ -1094,6 +1180,8 @@ def main():
             args.video_dir,
             clip_frames=args.clip_frames,
             frame_size=args.frame_size,
+            random_frame_sampling=args.random_frame_sampling,
+            frame_jitter=args.frame_jitter,
         )
     else:
         if args.video_dir is not None:
@@ -1135,6 +1223,7 @@ def main():
         "top_p": args.top_p,
         "top_k": args.top_k,
     }
+    stochastic_sampling = args.random_frame_sampling or args.frame_jitter
 
     with preds_path.open("w", newline="", encoding="utf-8") as fh_csv, logs_path.open("w", encoding="utf-8") as fh_log:
         w = csv.writer(fh_csv)
@@ -1154,7 +1243,14 @@ def main():
                 )
             kp = kp.astype(np.float32, copy=False)
             kp = normalise_keypoints(kp)
-            kp = pad_or_sample(kp, args.T, axis=0)
+            kp = pad_or_sample(
+                kp,
+                args.T,
+                axis=0,
+                stochastic=stochastic_sampling,
+                random_window=args.random_frame_sampling,
+                frame_jitter=args.frame_jitter,
+            )
             kp_t = torch.from_numpy(kp).unsqueeze(0).to(device)
             if args.half and device.type == "cuda":
                 kp_t = kp_t.half()

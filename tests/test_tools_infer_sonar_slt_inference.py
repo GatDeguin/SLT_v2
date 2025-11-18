@@ -270,9 +270,14 @@ def test_temporal_length_inherits_from_checkpoint(
     original_pad_or_sample = infer.pad_or_sample
     seen_targets: list[int] = []
 
-    def _tracking_pad_or_sample(array: np.ndarray, target_frames: int, axis: int = 0) -> np.ndarray:
+    def _tracking_pad_or_sample(
+        array: np.ndarray,
+        target_frames: int,
+        axis: int = 0,
+        **kwargs: object,
+    ) -> np.ndarray:
         seen_targets.append(target_frames)
-        return original_pad_or_sample(array, target_frames, axis=axis)
+        return original_pad_or_sample(array, target_frames, axis=axis, **kwargs)
 
     monkeypatch.setattr(infer, "pad_or_sample", _tracking_pad_or_sample)
 
