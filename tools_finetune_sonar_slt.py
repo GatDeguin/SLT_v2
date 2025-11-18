@@ -971,7 +971,9 @@ def _compute_batch_losses(
         z = adapter(keypoints, frames_tensor)  # [B,1024]
         mem_z = bridge(z).unsqueeze(1)  # [B,1,d_model]
 
-        s = text_pool.encode(texts).to(mem_z.dtype)
+        with torch.no_grad():
+            s = text_pool.encode(texts)
+        s = s.detach().to(mem_z.dtype)
         W_pinv_fp32 = pinv_cache.get(device=s.device)
         s_fp32 = s.to(torch.float32)
         s_1024_fp32 = torch.matmul(s_fp32, W_pinv_fp32.T).contiguous()
@@ -1045,10 +1047,11 @@ def _evaluate_on_loader(
     if dev_dl is None:
         return None
 
-    modules: List[nn.Module] = [adapter, bridge, decoder]
-    prev_states = [module.training for module in modules]
-    for module in modules:
-        module.eval()
+    module_likes: List[object] = [adapter, bridge, decoder, text_pool]
+    prev_states = [getattr(module, "training", False) for module in module_likes]
+    for module in module_likes:
+        if hasattr(module, "eval"):
+            module.eval()
 
     try:
         totals: Dict[str, float] = {}
@@ -1082,8 +1085,9 @@ def _evaluate_on_loader(
 
         return {key: total / num_batches for key, total in totals.items()}
     finally:
-        for module, was_training in zip(modules, prev_states):
-            module.train(was_training)
+        for module, was_training in zip(module_likes, prev_states):
+            if hasattr(module, "train"):
+                module.train(was_training)
 
 
 def train(cfg: TrainConfig) -> None:
@@ -1124,6 +1128,10 @@ def train(cfg: TrainConfig) -> None:
     # Model pieces
     device = resolve_device(cfg.device)
     decoder = AutoModelForSeq2SeqLM.from_pretrained(cfg.model_name)
+    text_teacher = AutoModelForSeq2SeqLM.from_pretrained(cfg.model_name)
+    for param in text_teacher.parameters():
+        param.requires_grad_(False)
+    text_teacher.eval()
     tok = AutoTokenizer.from_pretrained(cfg.model_name)
 
     lora_config = LoraConfig(
@@ -1135,6 +1143,7 @@ def train(cfg: TrainConfig) -> None:
         target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
     )
     decoder = get_peft_model(decoder, lora_config).to(device)
+    text_teacher = text_teacher.to(device).eval()
     # Keep the frozen decoder weights in FP32; autocast handles mixed-precision casts.
 
     # Bridge maps adapter’s 1024 to decoder d_model if needed
@@ -1160,7 +1169,8 @@ def train(cfg: TrainConfig) -> None:
     ).to(device)
     # Adapter gradients must stay in FP32 for stable unscaling during AMP.
 
-    text_pool = TextPooler(decoder, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)
+    text_pool = TextPooler(text_teacher, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)
+    text_pool.eval()
 
     # Estimate optimiser steps for schedulers (ceil division mirrors DataLoader semantics)
     batches_per_epoch = math.ceil(len(ds) / max(cfg.batch_size, 1))
