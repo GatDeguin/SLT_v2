@@ -791,6 +791,8 @@ class TrainConfig:
     sample_max_new_tokens: int = 64
     sample_num_beams: int = 4
     sample_metrics_lowercase: bool = False
+    pinv_recompute_every: int = 0
+    pinv_force_recompute: bool = False
 
 
 def _cuda_is_available() -> bool:
@@ -894,6 +896,60 @@ def _generate_sample_prediction(
             module.train(was_training)
 
 
+class BridgePinvCache:
+    """Cache ``torch.linalg.pinv`` for the bridge weight matrix."""
+
+    def __init__(
+        self,
+        bridge: nn.Linear,
+        *,
+        rcond: float = 1e-5,
+        force_recompute: bool = False,
+        recompute_interval: int = 0,
+    ) -> None:
+        self._bridge = bridge
+        self._rcond = rcond
+        self._force_recompute = force_recompute
+        self._recompute_interval = max(0, int(recompute_interval))
+        self._cached: Optional[torch.Tensor] = None
+        self._dirty = True
+        self._optimizer_steps = 0
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+
+    def notify_optimizer_step(self, bridge_updated: bool) -> None:
+        """Invalidate cached pseudo-inverse after optimizer activity."""
+
+        self._optimizer_steps += 1
+        if bridge_updated:
+            self._dirty = True
+        if self._recompute_interval > 0 and self._optimizer_steps % self._recompute_interval == 0:
+            self._dirty = True
+
+    def get(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        if self._force_recompute:
+            tensor = self._recompute()
+        elif self._cached is None or self._dirty:
+            tensor = self._recompute()
+        else:
+            tensor = self._cached
+
+        if device is not None and tensor.device != device:
+            tensor = tensor.to(device)
+        return tensor
+
+    def _recompute(self) -> torch.Tensor:
+        with torch.no_grad():
+            weight = self._bridge.weight
+            pinv = torch.linalg.pinv(weight.to(torch.float32), rcond=self._rcond)
+            if pinv.device != weight.device:
+                pinv = pinv.to(weight.device)
+            self._cached = pinv
+            self._dirty = False
+        return self._cached
+
+
 def _compute_batch_losses(
     *,
     cfg: TrainConfig,
@@ -906,6 +962,7 @@ def _compute_batch_losses(
     texts: Sequence[str],
     keypoints: torch.Tensor,
     frames_tensor: Optional[torch.Tensor],
+    pinv_cache: BridgePinvCache,
     nce_queue: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
     """Run a forward pass and return the weighted loss + metrics."""
@@ -915,10 +972,7 @@ def _compute_batch_losses(
         mem_z = bridge(z).unsqueeze(1)  # [B,1,d_model]
 
         s = text_pool.encode(texts).to(mem_z.dtype)
-        with torch.no_grad():
-            W = bridge.weight  # [d_model,1024]
-            W_f32 = W.to(torch.float32)
-            W_pinv_fp32 = torch.linalg.pinv(W_f32, rcond=1e-5)
+        W_pinv_fp32 = pinv_cache.get(device=s.device)
         s_fp32 = s.to(torch.float32)
         s_1024_fp32 = torch.matmul(s_fp32, W_pinv_fp32.T).contiguous()
         s_1024 = s_1024_fp32.to(z.dtype)
@@ -984,6 +1038,7 @@ def _evaluate_on_loader(
     text_pool: TextPooler,
     tokenizer,
     device: torch.device,
+    pinv_cache: BridgePinvCache,
 ) -> Optional[Dict[str, float]]:
     """Compute average losses over ``dev_dl`` using eval mode."""
 
@@ -1015,6 +1070,7 @@ def _evaluate_on_loader(
                     texts=texts,
                     keypoints=kp,
                     frames_tensor=frames_tensor,
+                    pinv_cache=pinv_cache,
                     nce_queue=None,
                 )
                 for key, value in metrics.items():
@@ -1084,6 +1140,11 @@ def train(cfg: TrainConfig) -> None:
     # Bridge maps adapter’s 1024 to decoder d_model if needed
     d_model = getattr(decoder.config, "d_model", None) or getattr(decoder.config, "hidden_size", DEFAULT_D_MODEL)
     bridge = nn.Linear(1024, d_model, bias=False).to(device)
+    pinv_cache = BridgePinvCache(
+        bridge,
+        force_recompute=cfg.pinv_force_recompute,
+        recompute_interval=cfg.pinv_recompute_every,
+    )
     # Bridge remains FP32 so GradScaler can safely unscale gradients.
 
     adapter = VisualFusionAdapter(
@@ -1110,6 +1171,7 @@ def train(cfg: TrainConfig) -> None:
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
     bridge_params = [p for p in bridge.parameters() if p.requires_grad]
     lora_params = [p for p in decoder.parameters() if p.requires_grad]
+    bridge_trainable = bool(bridge_params)
 
     lr_adapter = cfg.lr
     lr_bridge = cfg.bridge_lr if cfg.bridge_lr is not None else cfg.lr
@@ -1221,6 +1283,7 @@ def train(cfg: TrainConfig) -> None:
                 texts=texts,
                 keypoints=kp,
                 frames_tensor=frames_tensor,
+                pinv_cache=pinv_cache,
                 nce_queue=nce_queue,
             )
 
@@ -1239,6 +1302,7 @@ def train(cfg: TrainConfig) -> None:
                     torch.nn.utils.clip_grad_norm_(clip_params, float(cfg.max_grad_norm))
                 scale_before = scaler.get_scale()
                 scaler.step(opt)
+                pinv_cache.notify_optimizer_step(bridge_updated=bridge_trainable)
                 scaler.update()
                 if scheduler is not None and scaler.get_scale() >= scale_before:
                     scheduler.step()
@@ -1289,6 +1353,7 @@ def train(cfg: TrainConfig) -> None:
                     text_pool=text_pool,
                     tokenizer=tok,
                     device=device,
+                    pinv_cache=pinv_cache,
                 )
                 if dev_metrics is not None:
                     rec_dev = {
@@ -1491,6 +1556,7 @@ def train(cfg: TrainConfig) -> None:
                 torch.nn.utils.clip_grad_norm_(clip_params, float(cfg.max_grad_norm))
             scale_before = scaler.get_scale()
             scaler.step(opt)
+            pinv_cache.notify_optimizer_step(bridge_updated=bridge_trainable)
             scaler.update()
             if scheduler is not None and scaler.get_scale() >= scale_before:
                 scheduler.step()
@@ -1504,6 +1570,7 @@ def train(cfg: TrainConfig) -> None:
             torch.nn.utils.clip_grad_norm_(clip_params, float(cfg.max_grad_norm))
         scale_before = scaler.get_scale()
         scaler.step(opt)
+        pinv_cache.notify_optimizer_step(bridge_updated=bridge_trainable)
         scaler.update()
         if scheduler is not None and scaler.get_scale() >= scale_before:
             scheduler.step()
@@ -1650,6 +1717,20 @@ def parse_args() -> TrainConfig:
         action="store_true",
         help="Lowercase preview references and hypotheses before computing metrics",
     )
+    ap.add_argument(
+        "--pinv-recompute-every",
+        type=int,
+        default=0,
+        help=(
+            "Force pseudo-inverse recomputation every N optimizer steps in addition to"
+            " bridge updates (0 disables periodic refresh)."
+        ),
+    )
+    ap.add_argument(
+        "--pinv-force-recompute",
+        action="store_true",
+        help="Disable pseudo-inverse caching and recompute every batch for experiments.",
+    )
     args = ap.parse_args()
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
@@ -1705,6 +1786,8 @@ def parse_args() -> TrainConfig:
         sample_max_new_tokens=int(args.sample_max_new_tokens),
         sample_num_beams=int(args.sample_num_beams),
         sample_metrics_lowercase=bool(args.sample_metrics_lowercase),
+        pinv_recompute_every=int(args.pinv_recompute_every),
+        pinv_force_recompute=bool(args.pinv_force_recompute),
     )
 
 
