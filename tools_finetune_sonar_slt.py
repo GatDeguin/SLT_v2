@@ -71,6 +71,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
+    get_scheduler,
 )
 from transformers.modeling_outputs import BaseModelOutput
 
@@ -757,6 +758,9 @@ class TrainConfig:
     lr: float = 3e-4
     bridge_lr: Optional[float] = None
     lora_lr: Optional[float] = None
+    max_grad_norm: Optional[float] = None
+    lr_scheduler: Optional[str] = None
+    warmup_steps: int = 0
     weight_decay: float = 0.01
     device: str = "auto"  # auto|cuda|cpu|mps
     half: bool = False
@@ -1097,6 +1101,11 @@ def train(cfg: TrainConfig) -> None:
 
     text_pool = TextPooler(decoder, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)
 
+    # Estimate optimiser steps for schedulers (ceil division mirrors DataLoader semantics)
+    batches_per_epoch = math.ceil(len(ds) / max(cfg.batch_size, 1))
+    optimizer_steps_per_epoch = math.ceil(batches_per_epoch / max(cfg.accum, 1))
+    total_optimizer_steps = max(1, optimizer_steps_per_epoch * cfg.epochs)
+
     # Optimiser
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
     bridge_params = [p for p in bridge.parameters() if p.requires_grad]
@@ -1118,6 +1127,28 @@ def train(cfg: TrainConfig) -> None:
         raise RuntimeError("No trainable parameters found for optimiser")
 
     opt = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+    clip_params: List[nn.Parameter] = [
+        *adapter_params,
+        *bridge_params,
+        *lora_params,
+    ]
+    should_clip = bool(cfg.max_grad_norm and cfg.max_grad_norm > 0 and clip_params)
+
+    scheduler = None
+    if cfg.lr_scheduler:
+        scheduler_name = cfg.lr_scheduler.strip().lower()
+        if scheduler_name not in {"constant", "constant_with_warmup", "linear", "cosine", "cosine_with_restarts", "polynomial"}:
+            raise ValueError(
+                "Unsupported lr scheduler '{name}'. Choose from constant, constant_with_warmup, "
+                "linear, cosine, cosine_with_restarts, or polynomial."
+                .format(name=cfg.lr_scheduler)
+            )
+        scheduler = get_scheduler(
+            scheduler_name,
+            optimizer=opt,
+            num_warmup_steps=max(int(cfg.warmup_steps), 0),
+            num_training_steps=total_optimizer_steps,
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.half and device.type == "cuda")
 
     # Loader
@@ -1203,8 +1234,14 @@ def train(cfg: TrainConfig) -> None:
             is_last_batch = (batch_idx + 1) == total_batches
 
             if is_accum_boundary or is_last_batch:
+                if should_clip:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(clip_params, float(cfg.max_grad_norm))
+                scale_before = scaler.get_scale()
                 scaler.step(opt)
                 scaler.update()
+                if scheduler is not None and scaler.get_scale() >= scale_before:
+                    scheduler.step()
                 opt.zero_grad(set_to_none=True)
                 accum_counter = 0
 
@@ -1449,15 +1486,27 @@ def train(cfg: TrainConfig) -> None:
                             print(f"[preview] Saved metrics (generation failed) → {metrics_path}")
 
         if accum_counter != 0:
+            if should_clip:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(clip_params, float(cfg.max_grad_norm))
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
+            if scheduler is not None and scaler.get_scale() >= scale_before:
+                scheduler.step()
             opt.zero_grad(set_to_none=True)
             accum_counter = 0
 
     # Final checkpoint
     if accum_counter != 0:
+        if should_clip:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(clip_params, float(cfg.max_grad_norm))
+        scale_before = scaler.get_scale()
         scaler.step(opt)
         scaler.update()
+        if scheduler is not None and scaler.get_scale() >= scale_before:
+            scheduler.step()
         opt.zero_grad(set_to_none=True)
         accum_counter = 0
 
@@ -1498,6 +1547,33 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--bridge-lr", type=float, default=None)
     ap.add_argument("--lora-lr", type=float, default=None)
+    ap.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="Clip adapter/bridge/LoRA gradients to this norm before each optimizer step",
+    )
+    scheduler_choices = (
+        "constant",
+        "constant_with_warmup",
+        "linear",
+        "cosine",
+        "cosine_with_restarts",
+        "polynomial",
+    )
+    ap.add_argument(
+        "--lr-scheduler",
+        type=str,
+        choices=scheduler_choices,
+        default=None,
+        help="Optional learning rate scheduler applied to all parameter groups",
+    )
+    ap.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="Number of warmup steps supplied to the LR scheduler",
+    )
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument(
         "--device",
@@ -1592,6 +1668,9 @@ def parse_args() -> TrainConfig:
         lr=args.lr,
         bridge_lr=args.bridge_lr,
         lora_lr=args.lora_lr,
+        max_grad_norm=args.max_grad_norm,
+        lr_scheduler=args.lr_scheduler,
+        warmup_steps=int(args.warmup_steps),
         weight_decay=args.weight_decay,
         device=args.device,
         half=bool(args.half),
