@@ -64,6 +64,18 @@ Activate it by passing `--lam-nce` and tune the contrastive temperature with
 `--nce-temperature`. The implementation maintains a queue of recent sentence
 embeddings to provide additional negatives during training.
 
+## Monitoring validation losses
+
+`tools_finetune_sonar_slt.py` now accepts a held-out metadata file via
+`--dev-csv` as well as an `--eval-every` interval. When both are set the trainer
+builds a second `KPTextDataset` that mirrors the preprocessing (T sampling,
+frame clipping, and optional video loading) used for the training split so the
+semantic (`L_sem`), decoder CE (`L_ce`), auto-encoding (`L_ae`), and InfoNCE
+(`L_nce`) losses are comparable. Aggregated dev metrics are appended to
+`train_log.jsonl` with `"split": "dev"` and mirrored to `dev_log.jsonl`, letting
+you monitor whether CE/AE improvements transfer to your validation clips without
+pausing training.
+
 ## Uses
 
 ```Python
