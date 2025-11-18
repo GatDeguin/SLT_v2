@@ -57,10 +57,12 @@ try:  # pragma: no cover - optional dependency for multimodal checkpoints
 except Exception:  # pragma: no cover - optional dependency
     cv2 = None  # type: ignore[assignment]
 
-try:  # pragma: no cover - optional dependency
-    from slt.utils.visual_adapter import VisualFusionAdapter
-except Exception:  # pragma: no cover - keep inference usable without visual extras
-    VisualFusionAdapter = None  # type: ignore[assignment]
+from slt.utils.visual_adapter import (
+    AdapterConfig,
+    FusionAdapter,
+    KEYPOINT_CHANNELS,
+    VisualFusionAdapter,
+)
 
 try:
     from transformers import (
@@ -97,7 +99,6 @@ else:
         LOGGER.addHandler(handler)
     LOGGER.propagate = False
 
-KEYPOINT_CHANNELS = 3  # (x, y, conf)
 DEFAULT_SONAR_MODEL_NAME = "mtmlt/sonar-nllb-200-1.3B"
 DEFAULT_TGT_LANG = "spa_Latn"
 DEFAULT_CLIP_FRAMES = 16
@@ -267,88 +268,6 @@ def _resolve_device(name: str) -> torch.device:
 
 
 @dataclass
-class AdapterConfig:
-    hidden_size: int = 1024
-    keypoint_hidden: int = 512
-    fusion_layers: int = 4
-    fusion_heads: int = 8
-    dropout: float = 0.1
-    keypoint_layers: int = 4
-    keypoint_heads: int = 8
-
-
-class _TransformerEncoder(nn.Module):
-    def __init__(self, d_model: int, *, num_layers: int, nhead: int, dropout: float) -> None:
-        super().__init__()
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer_norm(self.encoder(self.dropout(x)))
-
-
-class KeypointEncoder(nn.Module):
-    def __init__(self, config: AdapterConfig, num_points: int) -> None:
-        super().__init__()
-        input_dim = num_points * KEYPOINT_CHANNELS
-        self.proj = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, config.keypoint_hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.keypoint_hidden, config.keypoint_hidden),
-        )
-        self.temporal = _TransformerEncoder(
-            config.keypoint_hidden,
-            num_layers=config.keypoint_layers,
-            nhead=config.keypoint_heads,
-            dropout=config.dropout,
-        )
-
-    def forward(self, kp_btnc: torch.Tensor) -> torch.Tensor:
-        B, T, N, C = kp_btnc.shape
-        x = kp_btnc.reshape(B, T, N * C)
-        x = self.proj(x)
-        return self.temporal(x)  # [B,T,hidden]
-
-
-class FusionAdapter(nn.Module):
-    """Keypoint‑only adapter that outputs a pooled vector z in SONAR space (D=1024)."""
-
-    def __init__(self, config: AdapterConfig, num_points: int) -> None:
-        super().__init__()
-        self.kp_enc = KeypointEncoder(config, num_points)
-        self.kp_proj = nn.Linear(config.keypoint_hidden, config.hidden_size)
-        self.keypoint_bias = nn.Parameter(torch.zeros(config.hidden_size))
-        self.fusion = _TransformerEncoder(
-            config.hidden_size,
-            num_layers=config.fusion_layers,
-            nhead=config.fusion_heads,
-            dropout=config.dropout,
-        )
-        self.out_norm = nn.LayerNorm(config.hidden_size)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
-
-    def forward(self, kp_btnc: torch.Tensor) -> torch.Tensor:
-        kp = self.kp_enc(kp_btnc)                 # [B,T,H_k]
-        kp = self.kp_proj(kp)                     # [B,T,D]
-        kp = kp + self.keypoint_bias.view(1, 1, -1)
-        fused = self.fusion(kp)                   # [B,T,D]
-        z = fused.mean(dim=1)                     # mean pooling
-        z = self.out_norm(z)
-        return self.out_proj(z)                   # [B,D]
-
-
 # -----------------------------
 # SONAR decoder wrapper
 # -----------------------------
@@ -974,6 +893,8 @@ def main():
         args.T = config_T
         LOGGER.info("Using T=%d from checkpoint config.", args.T)
 
+    config_multimodal = _maybe_bool(config.get("multimodal_adapter"))
+
     if args.video_dir is not None:
         args.video_dir = Path(args.video_dir).expanduser()
 
@@ -988,7 +909,24 @@ def main():
     if not isinstance(adapter_state, dict) or not isinstance(bridge_state, dict):
         raise TypeError("Checkpoint keys 'adapter' and 'bridge' must be state dicts")
 
-    uses_video = adapter_requires_video(adapter_state)
+    state_has_visual_backbones = adapter_requires_video(adapter_state)
+    if config_multimodal is None:
+        uses_video = state_has_visual_backbones
+        if uses_video:
+            LOGGER.info(
+                "Checkpoint config missing 'multimodal_adapter'; detected ViT/VideoMAE weights via state dict."
+            )
+    else:
+        uses_video = bool(config_multimodal)
+        if uses_video and not state_has_visual_backbones:
+            LOGGER.info(
+                "Checkpoint config indicates a multimodal adapter; using VisualFusionAdapter even though the state dict lacks ViT/VideoMAE prefixes."
+            )
+        elif not uses_video and state_has_visual_backbones:
+            LOGGER.warning(
+                "Checkpoint config marks the adapter as keypoint-only but ViT/VideoMAE weights were found."
+                " Visual weights will be ignored during inference."
+            )
 
     lora_state = ckpt.get("lora")
     lora_config_dict = ckpt.get("lora_config")

@@ -110,9 +110,41 @@ def multimodal_checkpoint(
             "freeze_vit": False,
             "freeze_videomae": False,
             "freeze_keypoint": False,
+            "multimodal_adapter": True,
         },
     }
     ckpt_path = tmp_path / "adapter_multimodal.pt"
+    torch.save(ckpt, ckpt_path)
+    return ckpt_path
+
+
+@pytest.fixture()
+def multimodal_weights_keypoint_flag_checkpoint(
+    tmp_path: Path,
+    hf_sonar_dir: Path,
+) -> Path:
+    adapter = infer.FusionAdapter(infer.AdapterConfig(), num_points=3)
+    adapter_state = adapter.state_dict()
+    adapter_state["vit.weight"] = torch.zeros(1)
+
+    decoder_model = AutoModelForSeq2SeqLM.from_pretrained(str(hf_sonar_dir))
+    d_model = getattr(decoder_model.config, "d_model", None) or getattr(
+        decoder_model.config, "hidden_size", 1024
+    )
+    bridge = torch.nn.Linear(1024, d_model, bias=False)
+    bridge_state = bridge.state_dict()
+
+    ckpt = {
+        "adapter": adapter_state,
+        "bridge": bridge_state,
+        "num_landmarks": 3,
+        "d_model": d_model,
+        "config": {
+            "model_name": str(hf_sonar_dir),
+            "multimodal_adapter": False,
+        },
+    }
+    ckpt_path = tmp_path / "adapter_visual_weights_flagged_kp.pt"
     torch.save(ckpt, ckpt_path)
     return ckpt_path
 
@@ -168,6 +200,54 @@ def test_inference_pipeline_runs(tmp_path: Path, sonar_checkpoint: Path, hf_sona
         records = [json.loads(line) for line in fh if line.strip()]
     assert records
 
+
+def test_config_flag_overrides_visual_state(
+    tmp_path: Path,
+    multimodal_weights_keypoint_flag_checkpoint: Path,
+    hf_sonar_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keypoints_dir = tmp_path / "kp_config_override"
+    keypoints_dir.mkdir()
+
+    rng = np.random.default_rng(7)
+    keypoints = rng.normal(size=(4, 3, infer.KEYPOINT_CHANNELS)).astype(np.float32)
+    np.save(keypoints_dir / "clip01.npy", keypoints)
+
+    meta_csv = tmp_path / "meta_config_override.csv"
+    _write_meta_csv(meta_csv, [{"id": "clip01", "text": "placeholder"}])
+
+    out_dir = tmp_path / "out_config_override"
+    args = [
+        "tools_infer_sonar_slt.py",
+        "--keypoints-dir",
+        str(keypoints_dir),
+        "--adapter-ckpt",
+        str(multimodal_weights_keypoint_flag_checkpoint),
+        "--csv",
+        str(meta_csv),
+        "--out",
+        str(out_dir),
+        "--sonar-model-dir",
+        str(hf_sonar_dir),
+        "--tgt-lang",
+        "en_XX",
+        "--T",
+        "3",
+        "--num-beams",
+        "1",
+        "--max-new-tokens",
+        "4",
+    ]
+    monkeypatch.setenv("TRANSFORMERS_CACHE", str((tmp_path / "hf_cache").resolve()))
+    monkeypatch.setattr(sys, "argv", args)
+
+    infer.main()
+
+    preds_path = out_dir / "preds.csv"
+    logs_path = out_dir / "logs.jsonl"
+    assert preds_path.exists()
+    assert logs_path.exists()
 
 def test_temporal_length_inherits_from_checkpoint(
     tmp_path: Path,

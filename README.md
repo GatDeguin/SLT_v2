@@ -30,7 +30,14 @@ Thanks to @cointegrated for providing the weights for the SONAR encoder part.
 
 ## Multimodal adapter dependencies
 
-Training or running the new visual fusion adapter requires additional packages:
+The lightweight `FusionAdapter` (keypoints only) ships with the default project
+dependencies (PyTorch, Transformers, NumPy) and is now automatically selected
+whenever `tools_finetune_sonar_slt.py` runs without `--video-dir`. This means
+you can fine-tune and run inference on keypoints alone without installing
+vision backbones such as ViT/VideoMAE.
+
+Supplying paired RGB clips via `--video-dir` switches the trainer/inference to
+the multimodal `VisualFusionAdapter`, which requires the additional packages:
 
 ```bash
 pip install timm transformers[video] opencv-python
