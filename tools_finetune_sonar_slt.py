@@ -121,6 +121,7 @@ except Exception:  # pragma: no cover - optional dependency
 try:  # pragma: no cover - optional dependency
     from slt.utils.visual_adapter import (
         AdapterConfig,
+        FusionAdapter,
         KEYPOINT_CHANNELS as ADAPTER_KEYPOINT_CHANNELS,
         VisualFusionAdapter,
     )
@@ -128,6 +129,13 @@ except Exception:  # pragma: no cover - ensure module import during tests
     ADAPTER_KEYPOINT_CHANNELS = 3
 
     class AdapterConfig:  # type: ignore[dead-code]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ModuleNotFoundError(
+                "Optional visual adapter dependencies are missing."
+                " Install project in editable mode to train the adapter."
+            )
+
+    class FusionAdapter:  # type: ignore[dead-code]
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise ModuleNotFoundError(
                 "Optional visual adapter dependencies are missing."
@@ -747,6 +755,7 @@ class TrainConfig:
     out_dir: Path
     dev_csv: Optional[Path] = None
     video_dir: Optional[Path] = None
+    multimodal_adapter: bool = False
     model_name: str = "mtmlt/sonar-nllb-200-1.3B"
     tgt_lang: str = "spa_Latn"
     T: int = DEFAULT_T
@@ -1103,6 +1112,8 @@ def train(cfg: TrainConfig) -> None:
     # Data
     if cfg.video_dir is not None and not cfg.video_dir.exists():
         raise FileNotFoundError(f"Video directory not found: {cfg.video_dir}")
+    use_multimodal = cfg.video_dir is not None
+    cfg.multimodal_adapter = bool(use_multimodal)
 
     ds = KPTextDataset(
         cfg.keypoints_dir,
@@ -1156,17 +1167,21 @@ def train(cfg: TrainConfig) -> None:
     )
     # Bridge remains FP32 so GradScaler can safely unscale gradients.
 
-    adapter = VisualFusionAdapter(
-        AdapterConfig(),
-        num_points=N,
-        vit_name=cfg.vit_model,
-        vit_checkpoint=cfg.vit_checkpoint,
-        freeze_vit=cfg.freeze_vit,
-        videomae_name=cfg.videomae_model,
-        videomae_checkpoint=cfg.videomae_checkpoint,
-        freeze_videomae=cfg.freeze_videomae,
-        freeze_keypoint=cfg.freeze_keypoint,
-    ).to(device)
+    adapter_config = AdapterConfig()
+    if use_multimodal:
+        adapter = VisualFusionAdapter(
+            adapter_config,
+            num_points=N,
+            vit_name=cfg.vit_model,
+            vit_checkpoint=cfg.vit_checkpoint,
+            freeze_vit=cfg.freeze_vit,
+            videomae_name=cfg.videomae_model,
+            videomae_checkpoint=cfg.videomae_checkpoint,
+            freeze_videomae=cfg.freeze_videomae,
+            freeze_keypoint=cfg.freeze_keypoint,
+        ).to(device)
+    else:
+        adapter = FusionAdapter(adapter_config, num_points=N).to(device)
     # Adapter gradients must stay in FP32 for stable unscaling during AMP.
 
     text_pool = TextPooler(text_teacher, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)

@@ -3,12 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-
-from models.visual_backbone import SpaMoFusion, SpaMoFusionConfig, ViTBackbone, VideoMAEBackbone
 
 KEYPOINT_CHANNELS = 3
 
@@ -71,6 +69,56 @@ class KeypointEncoder(nn.Module):
         return self.temporal(x)
 
 
+class FusionAdapter(nn.Module):
+    """Keypoint-only adapter mirroring the inference helper implementation."""
+
+    def __init__(self, config: AdapterConfig, num_points: int) -> None:
+        super().__init__()
+        self.kp_enc = KeypointEncoder(config, num_points)
+        self.kp_proj = nn.Linear(config.keypoint_hidden, config.hidden_size)
+        self.keypoint_bias = nn.Parameter(torch.zeros(config.hidden_size))
+        self.fusion = _TransformerEncoder(
+            config.hidden_size,
+            num_layers=config.fusion_layers,
+            nhead=config.fusion_heads,
+            dropout=config.dropout,
+        )
+        self.out_norm = nn.LayerNorm(config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+
+    def forward(
+        self,
+        keypoints: torch.Tensor,
+        frames: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if keypoints is None:
+            raise ValueError("FusionAdapter expects keypoints tensor")
+        kp = self.kp_enc(keypoints)  # [B,T,H_k]
+        kp = self.kp_proj(kp)  # [B,T,D]
+        kp = kp + self.keypoint_bias.view(1, 1, -1)
+        fused = self.fusion(kp)
+        pooled = fused.mean(dim=1)
+        pooled = self.out_norm(pooled)
+        return self.out_proj(pooled)
+
+
+def _import_visual_backbones() -> Tuple[type, ...]:
+    try:  # pragma: no cover - optional heavy dependency
+        from models.visual_backbone import (
+            SpaMoFusion,
+            SpaMoFusionConfig,
+            ViTBackbone,
+            VideoMAEBackbone,
+        )
+    except Exception as exc:  # pragma: no cover - surfacing clearer guidance
+        raise ModuleNotFoundError(
+            "VisualFusionAdapter requires the optional visual backbones."
+            " Install the project with timm/transformers[video] extras to enable it."
+        ) from exc
+
+    return SpaMoFusion, SpaMoFusionConfig, ViTBackbone, VideoMAEBackbone
+
+
 class VisualFusionAdapter(nn.Module):
     """Fuse keypoints with spatial/motion cues before bridging into SONAR."""
 
@@ -89,6 +137,8 @@ class VisualFusionAdapter(nn.Module):
         fusion_config: Optional[SpaMoFusionConfig] = None,
     ) -> None:
         super().__init__()
+        SpaMoFusion, SpaMoFusionConfig, ViTBackbone, VideoMAEBackbone = _import_visual_backbones()
+
         fusion_config = fusion_config or SpaMoFusionConfig(
             hidden_size=config.hidden_size,
             num_layers=config.fusion_layers,
