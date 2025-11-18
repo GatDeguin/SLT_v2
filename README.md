@@ -76,6 +76,24 @@ SONAR decoder that serves as the teacher for `TextPooler`. This guarantees that
 LoRA updates only touch the student decoder but requires keeping two copies of
 the checkpoint in memory (roughly 2× the original SONAR footprint).
 
+## Resuming interrupted fine-tuning runs
+
+Every training checkpoint now produces two artifacts:
+
+1. `runs/.../checkpoints/adapter_stepXXXX.pt` — adapter/bridge/LoRA weights for
+   inference.
+2. `runs/.../checkpoints/adapter_stepXXXX/training_state.pt` — optimizer,
+   scheduler, GradScaler, InfoNCE queue, and step/epoch counters required for
+   restarting training.
+
+`tools_finetune_sonar_slt.py` accepts `--resume-from` with the path to a
+checkpoint directory (or a `.pt` file). When omitted, the trainer automatically
+searches `{out}/checkpoints` for the most recent entry and resumes from it. This
+restores model weights, optimizer/LR scheduler state, AMP scaling, LoRA weights,
+and the InfoNCE queue so that momentum warmup and queue statistics survive
+interruptions. If a checkpoint lacks a stored queue (e.g., it predates this
+feature) the trainer will warn and rebuild the queue from scratch.
+
 ## Monitoring validation losses
 
 `tools_finetune_sonar_slt.py` now accepts a held-out metadata file via

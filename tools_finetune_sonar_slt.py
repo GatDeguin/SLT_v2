@@ -37,6 +37,8 @@ Notes
   with strong MSE magnitude regularizer and cosine term.
 - Optional InfoNCE alignment can be enabled with --lam-nce / --nce-temperature,
   using a queue of recent textual embeddings as extra negatives.
+- Each checkpoint folder stores `training_state.pt` (optimizer, scheduler, GradScaler,
+  InfoNCE queue) so interrupted runs can be restarted via `--resume-from /path/to/checkpoints/adapter_stepXXXX`.
 
 Dependencies
 ------------
@@ -45,6 +47,7 @@ Dependencies
 Outputs
 -------
   • {out}/checkpoints/adapter_stepXXXX.pt       # adapter + bridge weights
+  • {out}/checkpoints/adapter_stepXXXX/training_state.pt  # resume bundle (--resume-from)
   • {out}/train_log.jsonl                        # per‑step metrics
   • {out}/preds_dev.jsonl (optional quick eval)
 
@@ -52,6 +55,7 @@ Outputs
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -745,6 +749,95 @@ def _serialise_train_config(cfg: TrainConfig) -> Dict[str, object]:
     return serialised
 
 
+TRAINING_STATE_FILENAME = "training_state.pt"
+
+
+def _prepare_state_dict_on_cpu(state: Dict[str, object]) -> Dict[str, object]:
+    """Deep-copy ``state`` and ensure tensors are stored on CPU for serialization."""
+
+    cpu_state = copy.deepcopy(state)
+    stack: List[Dict[str, object]] = [cpu_state]
+    while stack:
+        current = stack.pop()
+        for key, value in list(current.items()):
+            if isinstance(value, torch.Tensor):
+                current[key] = value.detach().cpu()
+            elif isinstance(value, dict):
+                stack.append(value)
+    return cpu_state
+
+
+def _prepare_optimizer_state_dict(opt: torch.optim.Optimizer) -> Dict[str, object]:
+    return _prepare_state_dict_on_cpu(opt.state_dict())
+
+
+def _prepare_scheduler_state_dict(scheduler: Optional[object]) -> Optional[Dict[str, object]]:
+    if scheduler is None:
+        return None
+    return _prepare_state_dict_on_cpu(scheduler.state_dict())
+
+
+def _checkpoint_payload_path_from_target(target: Path) -> Optional[Path]:
+    """Resolve the saved ``.pt`` file associated with ``target``."""
+
+    if target.is_file():
+        return target
+    if target.is_dir():
+        candidate = target / TRAINING_STATE_FILENAME
+        if candidate.is_file():
+            return candidate
+        pt_files = sorted(target.glob("*.pt"))
+        if pt_files:
+            return pt_files[0]
+    return None
+
+
+def _discover_latest_checkpoint_target(checkpoints_root: Path) -> Optional[Path]:
+    if not checkpoints_root.exists():
+        return None
+    best_target: Optional[Path] = None
+    best_mtime = -1.0
+    for entry in checkpoints_root.iterdir():
+        candidate = _checkpoint_payload_path_from_target(entry)
+        if candidate is None or not candidate.exists():
+            continue
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best_mtime = mtime
+            best_target = entry
+    return best_target
+
+
+def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in opt.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _save_checkpoint_bundle(
+    *,
+    checkpoints_root: Path,
+    label: str,
+    base_payload: Dict[str, object],
+    resume_payload: Dict[str, object],
+) -> Tuple[Path, Path]:
+    """Save adapter-only and training-state checkpoints; return file + directory."""
+
+    checkpoints_root.mkdir(parents=True, exist_ok=True)
+    adapter_path = checkpoints_root / f"{label}.pt"
+    torch.save(base_payload, adapter_path)
+
+    checkpoint_dir = checkpoints_root / label
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    training_state_path = checkpoint_dir / TRAINING_STATE_FILENAME
+    torch.save(resume_payload, training_state_path)
+    return adapter_path, checkpoint_dir
+
+
 # -----------------------------
 # Training loop
 # -----------------------------
@@ -802,6 +895,7 @@ class TrainConfig:
     sample_metrics_lowercase: bool = False
     pinv_recompute_every: int = 0
     pinv_force_recompute: bool = False
+    resume_from: Optional[Path] = None
 
 
 def _cuda_is_available() -> bool:
@@ -1101,7 +1195,32 @@ def _evaluate_on_loader(
 
 def train(cfg: TrainConfig) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    (cfg.out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    checkpoints_root = cfg.out_dir / "checkpoints"
+    checkpoints_root.mkdir(parents=True, exist_ok=True)
+
+    resume_target = cfg.resume_from
+    user_requested_resume = resume_target is not None
+    if resume_target is not None:
+        resume_target = resume_target.expanduser()
+    if resume_target is None:
+        auto_target = _discover_latest_checkpoint_target(checkpoints_root)
+        if auto_target is not None:
+            resume_target = auto_target
+            print(f"[resume] Auto-selected checkpoint '{resume_target}'")
+    resume_payload_path: Optional[Path] = None
+    if resume_target is not None:
+        payload_candidate = _checkpoint_payload_path_from_target(resume_target)
+        if payload_candidate is None or not payload_candidate.exists():
+            if user_requested_resume:
+                print(f"[resume] Unable to find checkpoint payload inside '{resume_target}'. Starting fresh.")
+            else:
+                print(f"[resume] Skipping auto-resume; '{resume_target}' does not contain a checkpoint payload.")
+            resume_target = None
+        else:
+            resume_payload_path = payload_candidate
+            print(f"[resume] Attempting to restore training state from '{resume_target}'.")
+    else:
+        print("[resume] No checkpoint detected; starting from scratch.")
 
     # Resolve kp folder (kp → ke fallback if not present)
     if not cfg.keypoints_dir.exists():
@@ -1238,6 +1357,44 @@ def train(cfg: TrainConfig) -> None:
         )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.half and device.type == "cuda")
 
+    start_epoch = 0
+    step = 0
+    nce_queue: Optional[torch.Tensor] = None
+    if resume_payload_path is not None:
+        try:
+            checkpoint_state = torch.load(resume_payload_path, map_location="cpu")
+        except (RuntimeError, OSError, ValueError, EOFError) as exc:
+            print(f"[resume] Failed to load checkpoint '{resume_payload_path}': {exc}")
+        else:
+            required_keys = {"adapter", "bridge", "lora", "optimizer", "scaler", "step", "epoch"}
+            if not required_keys.issubset(checkpoint_state.keys()):
+                print("[resume] Checkpoint missing training state entries; starting from scratch.")
+            else:
+                adapter.load_state_dict(checkpoint_state["adapter"])
+                bridge.load_state_dict(checkpoint_state["bridge"])
+                decoder.load_state_dict(checkpoint_state.get("lora", {}), strict=False)
+                opt.load_state_dict(checkpoint_state["optimizer"])
+                _move_optimizer_state_to_device(opt, device)
+                scheduler_state = checkpoint_state.get("scheduler")
+                if scheduler_state is not None and scheduler is not None:
+                    scheduler.load_state_dict(scheduler_state)
+                elif scheduler_state is not None and scheduler is None:
+                    print("[resume] Checkpoint included an LR scheduler state but --lr-scheduler is disabled; ignoring.")
+                scaler_state = checkpoint_state.get("scaler")
+                if isinstance(scaler_state, dict):
+                    scaler.load_state_dict(scaler_state)
+                start_epoch = int(checkpoint_state.get("epoch", 0))
+                step = int(checkpoint_state.get("step", 0))
+                queue_state = checkpoint_state.get("nce_queue")
+                if isinstance(queue_state, torch.Tensor) and queue_state.numel() > 0:
+                    nce_queue = queue_state.to(device)
+                    print(f"[resume] Restored InfoNCE queue with {nce_queue.shape[0]} entries.")
+                elif cfg.lam_nce > 0:
+                    print("[resume] Checkpoint lacked an InfoNCE queue; starting empty.")
+                opt.zero_grad(set_to_none=True)
+                print(f"[resume] Restored epoch={start_epoch} step={step}.")
+            del checkpoint_state
+
     # Loader
     def collate(batch):
         ids = [b["id"] for b in batch]
@@ -1280,13 +1437,11 @@ def train(cfg: TrainConfig) -> None:
 
     preview_rng = random.Random(int(cfg.preview_seed))
 
-    step = 0
     log_path = cfg.out_dir / "train_log.jsonl"
     dev_log_path = cfg.out_dir / "dev_log.jsonl"
     accum_counter = 0
-    nce_queue: Optional[torch.Tensor] = None
     nce_queue_max = 4096
-    for epoch in range(cfg.epochs):
+    for epoch in range(start_epoch, cfg.epochs):
         total_batches = len(dl)
         for batch_idx, (ids, texts, kp, video) in enumerate(dl):
             step += 1
@@ -1404,7 +1559,8 @@ def train(cfg: TrainConfig) -> None:
                     )
 
             if step % cfg.save_every == 0:
-                ckpt = {
+                label = f"adapter_step{step:06d}"
+                base_ckpt = {
                     "adapter": adapter.state_dict(),
                     "bridge": bridge.state_dict(),
                     "lora": get_peft_model_state_dict(decoder),
@@ -1413,11 +1569,24 @@ def train(cfg: TrainConfig) -> None:
                     "d_model": d_model,
                     "num_landmarks": N,
                 }
-                path = cfg.out_dir / "checkpoints" / f"adapter_step{step:06d}.pt"
-                torch.save(ckpt, path)
-                print(f"[ckpt] Saved {path}")
+                resume_payload = dict(base_ckpt)
+                resume_payload.update(
+                    optimizer=_prepare_optimizer_state_dict(opt),
+                    scheduler=_prepare_scheduler_state_dict(scheduler),
+                    scaler=scaler.state_dict(),
+                    step=step,
+                    epoch=epoch,
+                    nce_queue=nce_queue.detach().cpu() if nce_queue is not None else None,
+                )
+                path, checkpoint_dir = _save_checkpoint_bundle(
+                    checkpoints_root=checkpoints_root,
+                    label=label,
+                    base_payload=base_ckpt,
+                    resume_payload=resume_payload,
+                )
+                print(f"[ckpt] Saved {path} (trainer state → {checkpoint_dir})")
                 if cfg.save_samples:
-                    preview_dir = cfg.out_dir / "checkpoints" / f"adapter_step{step:06d}" / "preview"
+                    preview_dir = checkpoint_dir / "preview"
                     preview_dir.mkdir(parents=True, exist_ok=True)
                     try:
                         sample_idx = preview_rng.randrange(len(ds))
@@ -1602,7 +1771,7 @@ def train(cfg: TrainConfig) -> None:
         opt.zero_grad(set_to_none=True)
         accum_counter = 0
 
-    path = cfg.out_dir / "checkpoints" / f"adapter_final.pt"
+    final_label = "adapter_final"
     ckpt = {
         "adapter": adapter.state_dict(),
         "bridge": bridge.state_dict(),
@@ -1612,8 +1781,22 @@ def train(cfg: TrainConfig) -> None:
         "d_model": d_model,
         "num_landmarks": N,
     }
-    torch.save(ckpt, path)
-    print(f"[done] Saved final checkpoint → {path}")
+    resume_payload = dict(ckpt)
+    resume_payload.update(
+        optimizer=_prepare_optimizer_state_dict(opt),
+        scheduler=_prepare_scheduler_state_dict(scheduler),
+        scaler=scaler.state_dict(),
+        step=step,
+        epoch=cfg.epochs,
+        nce_queue=nce_queue.detach().cpu() if nce_queue is not None else None,
+    )
+    path, checkpoint_dir = _save_checkpoint_bundle(
+        checkpoints_root=checkpoints_root,
+        label=final_label,
+        base_payload=ckpt,
+        resume_payload=resume_payload,
+    )
+    print(f"[done] Saved final checkpoint → {path} (trainer state → {checkpoint_dir})")
 
 
 def parse_args() -> TrainConfig:
@@ -1756,6 +1939,16 @@ def parse_args() -> TrainConfig:
         action="store_true",
         help="Disable pseudo-inverse caching and recompute every batch for experiments.",
     )
+    ap.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "Optional checkpoint directory or .pt file to resume from. "
+            "When omitted the trainer will automatically pick the most recent entry "
+            "under {out}/checkpoints if available."
+        ),
+    )
     args = ap.parse_args()
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
@@ -1813,6 +2006,7 @@ def parse_args() -> TrainConfig:
         sample_metrics_lowercase=bool(args.sample_metrics_lowercase),
         pinv_recompute_every=int(args.pinv_recompute_every),
         pinv_force_recompute=bool(args.pinv_force_recompute),
+        resume_from=args.resume_from,
     )
 
 

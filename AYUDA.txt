@@ -57,7 +57,13 @@ python tools_finetune_sonar_slt.py `
    --device cuda --save-every 100 --log-every 1 `
    --lam-sem 0.4 --mse-weight 1500 --cos-weight 1.5 `
    --lam-ce 1.5 --lam-ae 0.5 --lam-nce 0.03 --nce-temperature 0.07 `
-   --sample-metrics  --save-samples
+  --sample-metrics  --save-samples
+
+NOTA: cada checkpoint crea `checkpoints/adapter_stepXXXX/training_state.pt` con el
+estado del optimizador, scheduler, GradScaler y la cola InfoNCE. Usa
+`--resume-from runs\sonar_slt_finetune_lsa_v2\checkpoints\adapter_step001200` (por
+ejemplo) para reanudar de un checkpoint concreto; si no se indica, el script
+elige automáticamente el último disponible en `{out}/checkpoints`.
 
 
 
