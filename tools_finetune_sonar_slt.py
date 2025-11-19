@@ -1377,6 +1377,9 @@ def train(cfg: TrainConfig) -> None:
         if alt.exists():
             cfg.keypoints_dir = alt
 
+    # Logs
+    log_path = cfg.out_dir / "train_log.jsonl"
+
     # Data
     if cfg.video_dir is not None and not cfg.video_dir.exists():
         raise FileNotFoundError(f"Video directory not found: {cfg.video_dir}")
