@@ -342,6 +342,27 @@ def _read_meta_csv(path: Path) -> List[CsvRow]:
 # -----------------------------
 # Dataset
 # -----------------------------
+def _log_skipped_examples(
+    log_path: Path,
+    *,
+    split: str,
+    skipped: Sequence[Dict[str, object]],
+) -> None:
+    """Append a JSONL record describing skipped metadata rows."""
+
+    if not skipped:
+        return
+    record = {
+        "event": "skipped_missing",
+        "split": split,
+        "count": len(skipped),
+        "ids": [entry.get("id") for entry in skipped],
+        "details": skipped,
+    }
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 class KPTextDataset(Dataset):
     def __init__(
         self,
@@ -355,12 +376,19 @@ class KPTextDataset(Dataset):
         frame_size: int = DEFAULT_IMG_SIZE,
         random_frame_sampling: bool = False,
         frame_jitter: bool = False,
+        skip_missing: bool = True,
+        strict_missing: bool = False,
     ) -> None:
         self.keypoints_dir = keypoints_dir
         self.video_dir = video_dir
         if self.video_dir is not None and cv2 is None:
             raise RuntimeError("OpenCV (cv2) is required to load paired videos")
-        self.items = _read_meta_csv(csv_path)
+        self._skip_missing = bool(skip_missing and not strict_missing)
+        self._strict_missing = bool(strict_missing or not skip_missing)
+        self._keypoint_cache: Dict[str, Optional[Path]] = {}
+        self._video_cache: Dict[str, Optional[Path]] = {}
+        self.skipped_missing: List[Dict[str, object]] = []
+        self.items = self._filter_missing(_read_meta_csv(csv_path))
         if shuffle:
             RNG.shuffle(self.items)
         self.T = int(T)
@@ -369,6 +397,49 @@ class KPTextDataset(Dataset):
         self.random_frame_sampling = bool(random_frame_sampling)
         self.frame_jitter = bool(frame_jitter)
         self._rng = random.Random()
+        if not self.items:
+            raise ValueError(
+                "No training examples remain after filtering missing keypoints/videos"
+            )
+
+    def _filter_missing(self, items: List[CsvRow]) -> List[CsvRow]:
+        filtered: List[CsvRow] = []
+        skipped: List[Dict[str, object]] = []
+        for row in items:
+            missing: List[str] = []
+            kp_path = self._resolve_keypoints_path(row.vid)
+            if kp_path is None:
+                missing.append("keypoints")
+            video_missing = False
+            video_path: Optional[Path] = None
+            if self.video_dir is not None:
+                video_path = self._resolve_video_path(row.vid)
+                if video_path is None:
+                    missing.append("video")
+                    video_missing = True
+            if missing:
+                if self._strict_missing or not self._skip_missing:
+                    raise FileNotFoundError(
+                        f"Missing {', '.join(missing)} for id={row.vid}"
+                    )
+                skipped.append({"id": row.vid, "missing": missing})
+                continue
+            if kp_path is not None and row.vid not in self._keypoint_cache:
+                self._keypoint_cache[row.vid] = kp_path
+            if self.video_dir is not None and not video_missing:
+                self._video_cache[row.vid] = video_path
+            filtered.append(row)
+        self.skipped_missing = skipped
+        if skipped:
+            sample = ", ".join(entry["id"] for entry in skipped[:5])
+            missing_fields = sorted({m for entry in skipped for m in entry["missing"]})
+            suffix = f" (ejemplos: {sample})" if sample else ""
+            warnings.warn(
+                "Se omitieron %d clip(s) sin archivos %s; usa --strict-missing para exigirlos%s"
+                % (len(skipped), "/".join(missing_fields), suffix),
+                stacklevel=2,
+            )
+        return filtered
 
     def __len__(self) -> int:
         return len(self.items)
@@ -387,15 +458,11 @@ class KPTextDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.items[idx]
-        base = self.keypoints_dir / row.vid
-        kp_path: Optional[Path] = None
-        for ext in (".npz", ".npy"):
-            cand = base.with_suffix(ext)
-            if cand.exists():
-                kp_path = cand
-                break
+        kp_path = self._resolve_keypoints_path(row.vid)
         if kp_path is None:
-            raise FileNotFoundError(f"Keypoints not found for id={row.vid} in {self.keypoints_dir}")
+            raise FileNotFoundError(
+                f"Keypoints not found for id={row.vid} in {self.keypoints_dir}"
+            )
         keypoints = self._load_np(kp_path)
         keypoints = reshape_flat_keypoints(
             keypoints, num_landmarks=0, expected_channels=KEYPOINT_CHANNELS
@@ -440,8 +507,12 @@ class KPTextDataset(Dataset):
         if self.video_dir is None:
             return None
 
+        if stem in self._video_cache:
+            return self._video_cache[stem]
+
         raw = stem.strip()
         if not raw:
+            self._video_cache[stem] = None
             return None
 
         candidates: List[str] = []
@@ -462,6 +533,7 @@ class KPTextDataset(Dataset):
         for name in candidates:
             literal = self.video_dir / name
             if literal.exists():
+                self._video_cache[stem] = literal
                 return literal
 
             # Only append extensions when the candidate does not already provide one.
@@ -471,8 +543,26 @@ class KPTextDataset(Dataset):
             for ext in VIDEO_EXTENSIONS:
                 candidate = self.video_dir / f"{name}{ext}"
                 if candidate.exists():
+                    self._video_cache[stem] = candidate
                     return candidate
 
+        self._video_cache[stem] = None
+        return None
+
+    def _resolve_keypoints_path(self, vid: str) -> Optional[Path]:
+        if vid in self._keypoint_cache:
+            return self._keypoint_cache[vid]
+        base = self.keypoints_dir / vid
+        candidates = [base]
+        for ext in (".npz", ".npy"):
+            cand = base.with_suffix(ext)
+            if cand not in candidates:
+                candidates.append(cand)
+        for cand in candidates:
+            if cand.exists():
+                self._keypoint_cache[vid] = cand
+                return cand
+        self._keypoint_cache[vid] = None
         return None
 
     def _load_video(self, path: Path) -> np.ndarray:
@@ -911,6 +1001,8 @@ class TrainConfig:
     frame_size: int = DEFAULT_IMG_SIZE
     random_frame_sampling: bool = False
     frame_jitter: bool = False
+    skip_missing: bool = True
+    strict_missing: bool = False
     batch_size: int = 8
     accum: int = 2
     epochs: int = 10
@@ -1300,7 +1392,10 @@ def train(cfg: TrainConfig) -> None:
         frame_size=cfg.frame_size,
         random_frame_sampling=cfg.random_frame_sampling,
         frame_jitter=cfg.frame_jitter,
+        skip_missing=cfg.skip_missing,
+        strict_missing=cfg.strict_missing,
     )
+    _log_skipped_examples(log_path, split="train_meta", skipped=ds.skipped_missing)
     dev_ds: Optional[KPTextDataset] = None
     if cfg.dev_csv is not None:
         dev_ds = KPTextDataset(
@@ -1311,7 +1406,10 @@ def train(cfg: TrainConfig) -> None:
             clip_frames=cfg.clip_frames,
             frame_size=cfg.frame_size,
             shuffle=False,
+            skip_missing=cfg.skip_missing,
+            strict_missing=cfg.strict_missing,
         )
+        _log_skipped_examples(log_path, split="dev_meta", skipped=dev_ds.skipped_missing)
     N = count_landmarks(ds[0]["keypoints"])  # landmarks
 
     # Model pieces
@@ -1496,7 +1594,6 @@ def train(cfg: TrainConfig) -> None:
 
     preview_rng = random.Random(int(cfg.preview_seed))
 
-    log_path = cfg.out_dir / "train_log.jsonl"
     dev_log_path = cfg.out_dir / "dev_log.jsonl"
     accum_counter = 0
     nce_queue_max = 4096
@@ -1893,6 +1990,20 @@ def parse_args() -> TrainConfig:
             " Disable via --no-frame-jitter."
         ),
     )
+    ap.add_argument(
+        "--skip-missing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Skip CSV entries whose keypoints/video files are missing."
+            " Disable via --no-skip-missing to treat missing files as errors."
+        ),
+    )
+    ap.add_argument(
+        "--strict-missing",
+        action="store_true",
+        help="Raise an error when any referenced keypoints/video file is missing.",
+    )
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=10)
@@ -2027,6 +2138,10 @@ def parse_args() -> TrainConfig:
         ),
     )
     args = ap.parse_args()
+    if args.strict_missing or not args.skip_missing:
+        args.strict_missing = True
+        args.skip_missing = False
+
     return TrainConfig(
         keypoints_dir=args.keypoints_dir,
         csv=args.csv,
@@ -2040,6 +2155,8 @@ def parse_args() -> TrainConfig:
         frame_size=args.frame_size,
         random_frame_sampling=args.random_frame_sampling,
         frame_jitter=args.frame_jitter,
+        skip_missing=bool(args.skip_missing),
+        strict_missing=bool(args.strict_missing),
         batch_size=args.batch_size,
         accum=args.accum,
         epochs=args.epochs,
