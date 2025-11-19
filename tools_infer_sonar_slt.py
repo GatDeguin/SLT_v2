@@ -46,7 +46,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path, WindowsPath
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -594,6 +594,21 @@ class Clip:
     video_path: Optional[Path] = None
 
 
+def _warn_skipped_entries(skipped: Sequence[Dict[str, object]]) -> None:
+    if not skipped:
+        return
+    missing = sorted({m for entry in skipped for m in entry.get("missing", [])})
+    sample_ids = [str(entry.get("id")) for entry in skipped[:5] if entry.get("id")]
+    suffix = f" (examples: {', '.join(sample_ids)})" if sample_ids else ""
+    label = "/".join(missing or ["files"])
+    LOGGER.warning(
+        "Skipped %d clip(s) missing %s; rerun with --strict-missing to fail.%s",
+        len(skipped),
+        label,
+        suffix,
+    )
+
+
 def _normalise_candidate(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -627,6 +642,8 @@ class VideoClipLoader:
         self._rng = random.Random()
 
     def resolve(self, clip: Clip) -> Optional[Path]:
+        if clip.video_path is not None and clip.video_path.exists():
+            return clip.video_path
         candidates: List[str] = []
 
         def push(raw: Optional[str]) -> None:
@@ -659,7 +676,7 @@ class VideoClipLoader:
         return None
 
     def load(self, clip: Clip) -> np.ndarray:
-        path = self.resolve(clip)
+        path = clip.video_path or self.resolve(clip)
         if path is None:
             raise FileNotFoundError(
                 f"Video not found for id={clip.clip_id} in {self.video_dir}"
@@ -703,10 +720,18 @@ def load_meta(csv_path: Path) -> List[Dict[str, str]]:
     return rows
 
 
-def resolve_clips(rows: List[Dict[str, str]], keypoints_dir: Optional[Path]) -> List[Clip]:
+def resolve_clips(
+    rows: List[Dict[str, str]],
+    keypoints_dir: Optional[Path],
+    *,
+    skip_missing: bool = True,
+    strict_missing: bool = False,
+) -> Tuple[List[Clip], List[Dict[str, object]]]:
     if keypoints_dir is None or not keypoints_dir.exists():
         raise FileNotFoundError("--keypoints-dir must point to existing .npz/.npy files")
     out: List[Clip] = []
+    skipped: List[Dict[str, object]] = []
+    strict = bool(strict_missing or not skip_missing)
     for row in rows:
         clip_id_raw = row.get("id") or row.get("video_id") or row.get("video")
         if not clip_id_raw:
@@ -728,13 +753,42 @@ def resolve_clips(rows: List[Dict[str, str]], keypoints_dir: Optional[Path]) -> 
                 kp_path = cand
                 break
         if kp_path is None:
-            raise FileNotFoundError(
-                f"Keypoints not found for id={clip_id} in {keypoints_dir}"
-            )
+            message = f"Keypoints not found for id={clip_id} in {keypoints_dir}"
+            if strict:
+                raise FileNotFoundError(message)
+            skipped.append({"id": clip_id, "missing": ["keypoints"]})
+            continue
 
         video_name = row.get("video") or row.get("file") or kp_path.stem
         out.append(Clip(clip_id=clip_id, keypoints_path=kp_path, video_name=video_name))
-    return out
+    _warn_skipped_entries(skipped)
+    return out, skipped
+
+
+def filter_missing_videos(
+    clips: Sequence[Clip],
+    video_loader: VideoClipLoader,
+    *,
+    skip_missing: bool,
+    strict_missing: bool,
+) -> Tuple[List[Clip], List[Dict[str, object]]]:
+    strict = bool(strict_missing or not skip_missing)
+    filtered: List[Clip] = []
+    skipped: List[Dict[str, object]] = []
+    for clip in clips:
+        path = video_loader.resolve(clip)
+        if path is None:
+            message = (
+                f"Video not found for id={clip.clip_id} in {video_loader.video_dir}"
+            )
+            if strict:
+                raise FileNotFoundError(message)
+            skipped.append({"id": clip.clip_id, "missing": ["video"]})
+            continue
+        clip.video_path = path
+        filtered.append(clip)
+    _warn_skipped_entries(skipped)
+    return filtered, skipped
 
 
 def load_keypoints_array(path: Path) -> np.ndarray:
@@ -823,6 +877,20 @@ def main():
             " Disable via --no-frame-jitter."
         ),
     )
+    ap.add_argument(
+        "--skip-missing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Skip clips whose keypoints/video files are missing."
+            " Disable via --no-skip-missing to treat missing files as fatal."
+        ),
+    )
+    ap.add_argument(
+        "--strict-missing",
+        action="store_true",
+        help="Raise an error when any required keypoints/video file is missing.",
+    )
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--half", action="store_true")
     ap.add_argument("--num-beams", type=int, default=4)
@@ -884,6 +952,9 @@ def main():
         help="Device for loading the adapter checkpoint (e.g., 'cpu', 'cuda')",
     )
     args = ap.parse_args()
+    if args.strict_missing or not args.skip_missing:
+        args.strict_missing = True
+        args.skip_missing = False
     cli_args = sys.argv[1:]
     tgt_lang_from_cli = any(arg.startswith("--tgt-lang") for arg in cli_args)
     sonar_model_from_cli = any(arg.startswith("--sonar-model-dir") for arg in cli_args)
@@ -906,7 +977,13 @@ def main():
 
     # Load data index
     rows = load_meta(args.csv)
-    clips = resolve_clips(rows, args.keypoints_dir)
+    clips, skipped_keypoints = resolve_clips(
+        rows,
+        args.keypoints_dir,
+        skip_missing=args.skip_missing,
+        strict_missing=args.strict_missing,
+    )
+    skipped_entries: List[Dict[str, object]] = list(skipped_keypoints)
 
     if not args.adapter_ckpt.is_file():
         raise FileNotFoundError(f"Adapter checkpoint not found: {args.adapter_ckpt}")
@@ -1183,6 +1260,13 @@ def main():
             random_frame_sampling=args.random_frame_sampling,
             frame_jitter=args.frame_jitter,
         )
+        clips, skipped_video = filter_missing_videos(
+            clips,
+            video_loader,
+            skip_missing=args.skip_missing,
+            strict_missing=args.strict_missing,
+        )
+        skipped_entries.extend(skipped_video)
     else:
         if args.video_dir is not None:
             LOGGER.info(
@@ -1190,6 +1274,9 @@ def main():
             )
         adapter_module = FusionAdapter(adapter_config, num_landmarks).to(device)
         video_loader = None
+
+    if not clips:
+        raise ValueError("No clips remain after filtering missing keypoints/video files.")
 
     # Build adapter model
     model = SonarSLTInference(adapter_module, expects_frames=uses_video).to(device)
@@ -1228,6 +1315,20 @@ def main():
     with preds_path.open("w", newline="", encoding="utf-8") as fh_csv, logs_path.open("w", encoding="utf-8") as fh_log:
         w = csv.writer(fh_csv)
         w.writerow(["id", "video", "lang", "text"])  # header
+        if skipped_entries:
+            fh_log.write(
+                json.dumps(
+                    {
+                        "event": "skipped_missing",
+                        "count": len(skipped_entries),
+                        "ids": [entry.get("id") for entry in skipped_entries],
+                        "details": skipped_entries,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            fh_log.flush()
 
         for clip in clips:
             if not clip.keypoints_path.exists():
