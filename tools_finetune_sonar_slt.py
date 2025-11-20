@@ -1464,7 +1464,8 @@ def train(cfg: TrainConfig) -> None:
     # Adapter gradients must stay in FP32 for stable unscaling during AMP.
 
     text_pool = TextPooler(text_teacher, tok, cfg.tgt_lang, num_layers=cfg.text_pool_layers)
-    text_pool.eval()
+    if hasattr(text_pool, "eval"):
+        text_pool.eval()
 
     # Estimate optimiser steps for schedulers (ceil division mirrors DataLoader semantics)
     batches_per_epoch = math.ceil(len(ds) / max(cfg.batch_size, 1))
