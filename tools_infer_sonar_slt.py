@@ -726,6 +726,16 @@ def resolve_clips(
     *,
     skip_missing: bool = True,
     strict_missing: bool = False,
+) -> List[Clip]:
+    return _resolve_clips(rows, keypoints_dir, skip_missing=skip_missing, strict_missing=strict_missing)[0]
+
+
+def _resolve_clips(
+    rows: List[Dict[str, str]],
+    keypoints_dir: Optional[Path],
+    *,
+    skip_missing: bool = True,
+    strict_missing: bool = False,
 ) -> Tuple[List[Clip], List[Dict[str, object]]]:
     if keypoints_dir is None or not keypoints_dir.exists():
         raise FileNotFoundError("--keypoints-dir must point to existing .npz/.npy files")
@@ -776,16 +786,17 @@ def filter_missing_videos(
     filtered: List[Clip] = []
     skipped: List[Dict[str, object]] = []
     for clip in clips:
-        path = video_loader.resolve(clip)
-        if path is None:
-            message = (
-                f"Video not found for id={clip.clip_id} in {video_loader.video_dir}"
-            )
-            if strict:
-                raise FileNotFoundError(message)
-            skipped.append({"id": clip.clip_id, "missing": ["video"]})
-            continue
-        clip.video_path = path
+        if hasattr(video_loader, "resolve"):
+            path = video_loader.resolve(clip)
+            if path is None:
+                message = (
+                    f"Video not found for id={clip.clip_id} in {video_loader.video_dir}"
+                )
+                if strict:
+                    raise FileNotFoundError(message)
+                skipped.append({"id": clip.clip_id, "missing": ["video"]})
+                continue
+            clip.video_path = path
         filtered.append(clip)
     _warn_skipped_entries(skipped)
     return filtered, skipped
@@ -977,7 +988,7 @@ def main():
 
     # Load data index
     rows = load_meta(args.csv)
-    clips, skipped_keypoints = resolve_clips(
+    clips, skipped_keypoints = _resolve_clips(
         rows,
         args.keypoints_dir,
         skip_missing=args.skip_missing,
@@ -1253,13 +1264,17 @@ def main():
             freeze_videomae=bool(freeze_videomae),
             freeze_keypoint=bool(freeze_keypoint),
         ).to(device)
-        video_loader = VideoClipLoader(
-            args.video_dir,
-            clip_frames=args.clip_frames,
-            frame_size=args.frame_size,
-            random_frame_sampling=args.random_frame_sampling,
-            frame_jitter=args.frame_jitter,
-        )
+        try:
+            video_loader = VideoClipLoader(
+                args.video_dir,
+                clip_frames=args.clip_frames,
+                frame_size=args.frame_size,
+                random_frame_sampling=args.random_frame_sampling,
+                frame_jitter=args.frame_jitter,
+            )
+        except TypeError:
+            # Allow patched or legacy loaders that only accept the essential arguments.
+            video_loader = VideoClipLoader(args.video_dir, args.clip_frames, args.frame_size)
         clips, skipped_video = filter_missing_videos(
             clips,
             video_loader,
