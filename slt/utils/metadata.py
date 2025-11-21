@@ -96,6 +96,10 @@ def parse_split_column(raw: str) -> List[SplitSegment]:
             raise ValueError(
                 f"Segmento con tiempos inválidos en posición {idx}: {entry!r}"
             )
+        if start < 0 or end < 0 or end <= start:
+            raise ValueError(
+                f"Segmento con rango temporal inválido en posición {idx}: {entry!r}"
+            )
         segments.append(SplitSegment(segment_text, start, end))
 
     return segments
