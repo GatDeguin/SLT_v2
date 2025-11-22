@@ -1282,6 +1282,12 @@ def _compute_batch_losses(
     return loss, metrics, s_norm
 
 
+def _metrics_are_finite(metrics: Dict[str, torch.Tensor]) -> bool:
+    """Return True when every tensor in ``metrics`` is finite."""
+
+    return all(torch.isfinite(tensor).all() for tensor in metrics.values())
+
+
 def _evaluate_on_loader(
     dev_dl: DataLoader,
     *,
@@ -1626,6 +1632,14 @@ def train(cfg: TrainConfig) -> None:
                 pinv_cache=pinv_cache,
                 nce_queue=nce_queue,
             )
+
+            if not _metrics_are_finite(metrics):
+                bad_terms = [name for name, tensor in metrics.items() if not torch.isfinite(tensor).all()]
+                bad_terms_str = ", ".join(bad_terms) if bad_terms else "losses"
+                print(f"[nan] Skipping step {step}: detected non-finite values in {bad_terms_str}.")
+                opt.zero_grad(set_to_none=True)
+                accum_counter = 0
+                continue
 
             batches_remaining_after_current = total_batches - (batch_idx + 1)
             effective_accum = min(cfg.accum, accum_counter + batches_remaining_after_current)
